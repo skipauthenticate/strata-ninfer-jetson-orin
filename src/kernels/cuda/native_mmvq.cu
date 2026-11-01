@@ -2652,4 +2652,78 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
 void native_mmvq_il_tune(int) {}
 #endif  // !__HIPCC__
 
+// ar diagnostic (STRATA_BW_PROBE=1): the card's plain streaming read bandwidth, to know how far the decode kernels
+// (~90-120 GB/s by the stage table) are from it.  Prints and returns; nothing else reads it.
+namespace {
+template <int U>
+__global__ void bw_read_kernel(const uint4* __restrict__ p, size_t n, unsigned* out) {
+    unsigned acc = 0;
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    for (; i + (U - 1) * stride < n; i += U * stride) {
+        uint4 v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) v[u] = __ldg(p + i + u * stride);
+#pragma unroll
+        for (int u = 0; u < U; ++u) acc ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
+    }
+    for (; i < n; i += stride) { const uint4 v = __ldg(p + i); acc ^= v.x ^ v.y ^ v.z ^ v.w; }
+    if (acc == 0x9e3779b9u) out[0] = acc;   // keeps the loads
+}
+}  // namespace
+void gpu_read_bw_probe() {
+    const char* e = std::getenv("STRATA_BW_PROBE");
+    if (e == nullptr || e[0] != '1') return;
+    const size_t bytes = (size_t) 512 << 20, n = bytes / sizeof(uint4);
+    uint4* buf = nullptr;
+    unsigned* out = nullptr;
+    if (cudaMalloc(&buf, bytes) != cudaSuccess || cudaMalloc(&out, sizeof(unsigned)) != cudaSuccess) {
+        cudaGetLastError();
+        std::fprintf(stderr, "strata bw-probe: allocation failed\n");
+        return;
+    }
+    cudaMemset(buf, 1, bytes);
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    const auto run = [&](int u, int blocks_per_sm) {
+        float best = 1e30f;
+        for (int rep = 0; rep < 6; ++rep) {
+            cudaEventRecord(a);
+            const unsigned g = (unsigned) (sms * blocks_per_sm);
+            if (u == 1) bw_read_kernel<1><<<g, 256>>>(buf, n, out);
+            else if (u == 4) bw_read_kernel<4><<<g, 256>>>(buf, n, out);
+            else bw_read_kernel<8><<<g, 256>>>(buf, n, out);
+            cudaEventRecord(b);
+            cudaEventSynchronize(b);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, a, b);
+            if (rep > 0 && ms < best) best = ms;   // rep 0 warms up
+        }
+        std::fprintf(stderr, "strata bw-probe: read %d MiB, uint4 x%d in flight, %d SMs x %d blocks of 256: %.1f GB/s (%.3f ms)\n",
+                     (int) (bytes >> 20), u, sms, blocks_per_sm, bytes / (best * 1e6), best);
+    };
+    for (int u : {1, 4, 8})
+        for (int bps : {2, 4, 6}) run(u, bps);
+    float best = 1e30f;   // device-to-device copy: bytes read + bytes written
+    for (int rep = 0; rep < 6; ++rep) {
+        cudaEventRecord(a);
+        cudaMemcpyAsync(buf, buf + n / 2, bytes / 2, cudaMemcpyDeviceToDevice);
+        cudaEventRecord(b);
+        cudaEventSynchronize(b);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        if (rep > 0 && ms < best) best = ms;
+    }
+    std::fprintf(stderr, "strata bw-probe: D2D copy %d MiB: %.1f GB/s read+write (%.3f ms)\n", (int) (bytes >> 21),
+                 bytes / (best * 1e6), best);
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+    cudaFree(out);
+    cudaFree(buf);
+    cudaGetLastError();
+}
+
 } // namespace strata::kernels

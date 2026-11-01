@@ -91,6 +91,8 @@
 
 #include <cuda_runtime.h>
 
+namespace strata::kernels { void gpu_read_bw_probe(); }   // native_mmvq.cu (ar diagnostic)
+
 #include <array>
 #include <chrono>
 #include <algorithm>
@@ -2788,6 +2790,7 @@ int main(int argc, char** argv) {
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
     // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
     // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
+    strata::kernels::gpu_read_bw_probe();   // ar diagnostic, STRATA_BW_PROBE=1 only
     if (o.pcie_frac < 0.0) {
         const double base = native_pack ? 0.55 : 0.2;
         std::string bursts;
