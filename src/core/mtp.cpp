@@ -1431,6 +1431,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     };
 
     int n = 0;
+    double first_ms = -1.0;
     if (min_p <= 0.0f && max_steps > 0) {
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
@@ -1480,6 +1481,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             strata::platform::mapped_memory_acquire();
         };
         wait_step(0);
+        first_ms = ms_since(t0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
@@ -1507,7 +1509,14 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
-    ms_draft += ms_since(t0);
+    const double all_ms = ms_since(t0);
+    if (first_ms >= 0.0 && T <= 8) {
+        ms_first_T[T] += first_ms;
+        n_first_T[T] += 1;
+        ms_chain += all_ms - first_ms;
+        n_chain += n - 1;
+    }
+    ms_draft += all_ms;
     ++rounds;
     return true;
 }

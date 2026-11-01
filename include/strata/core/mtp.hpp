@@ -144,6 +144,9 @@ public:
 
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
+    // ar (printed with STRATA_DECODE_TIMING): draft() up to draft 0 (the round graph: T catch-up rows + draft 0) by T,
+    // and the chain steps after it
+    double ms_first_T[9] = {}, n_first_T[9] = {}, ms_chain = 0, n_chain = 0;
 
     /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
     /// state, the first cell a round can still read, its device, and a wait for its own stream.

@@ -11706,6 +11706,20 @@ int main(int argc, char** argv) {
                         byT += b;
                     }
                 std::fprintf(stderr, "strata decode by window size:%s\n", byT.c_str());
+                {   // ar: the drafter's round graph by catch-up rows T (= accepted + 1) vs its chain steps
+                    std::string f;
+                    for (int t = 1; t <= 8; ++t)
+                        if (mtp.n_first_T[t] > 0) {
+                            char b[64];
+                            std::snprintf(b, sizeof b, " T%d %.0fx %.2f ms |", t, mtp.n_first_T[t], mtp.ms_first_T[t] / mtp.n_first_T[t]);
+                            f += b;
+                        }
+                    std::fprintf(stderr, "strata draft round to draft 0 by catch-up rows:%s chain %.0f steps, %.2f ms a step\n",
+                                 f.c_str(), mtp.n_chain, mtp.n_chain > 0 ? mtp.ms_chain / mtp.n_chain : 0.0);
+                    for (int t = 0; t < 9; ++t) { mtp.ms_first_T[t] = 0; mtp.n_first_T[t] = 0; }
+                    mtp.ms_chain = 0;
+                    mtp.n_chain = 0;
+                }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;
