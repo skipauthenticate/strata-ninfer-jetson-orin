@@ -370,6 +370,20 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
             weights_.push_back(item.data.release());
         }
+        {   // the ggml types the dense GEMVs read, by output rows (the MMVQ IL rows table is per type and n_out class)
+            std::set<std::pair<int, int64_t>> keys;
+            for (const auto& item : pending) keys.insert({item.type, (int64_t) item.ref->ne1});
+            std::string s;
+            for (const auto& k : keys) {
+                size_t n = 0;
+                uint64_t b = 0;
+                for (const auto& item : pending)
+                    if (item.type == k.first && (int64_t) item.ref->ne1 == k.second) { ++n; b += item.bytes; }
+                s += " t" + std::to_string(k.first) + "x" + std::to_string(k.second) + ":" + std::to_string(n) + "/" +
+                     std::to_string(b >> 20) + "MiB";
+            }
+            std::fprintf(stderr, "native dense: types (t<ggml type>x<n_out>:count/size):%s\n", s.c_str());
+        }
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
                          packed_count, packed_bytes / 1048576.0);

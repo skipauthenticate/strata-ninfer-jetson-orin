@@ -658,6 +658,11 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     if (dhead_ == nullptr && shared == nullptr && !full_head_env()) {
         std::vector<uint8_t> raw;
         if (read_file(vocab_file(), raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
+            // STRATA_DRAFT_VOCAB_TOP=N (opt-in): only the subset's first N tokens, a smaller draft head read per draft
+            // step. Drafting policy only: every draft is still verified exactly.
+            const char* top = std::getenv("STRATA_DRAFT_VOCAB_TOP");
+            if (top != nullptr && std::atoll(top) > 0 && (size_t) std::atoll(top) * 4 < raw.size())
+                raw.resize((size_t) std::atoll(top) * 4);
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess) {
