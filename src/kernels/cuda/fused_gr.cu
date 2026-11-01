@@ -849,6 +849,9 @@ int down_chunk(bool staged, int* tile_out) {
 #if STRATA_GR_FAST_BUILD
 __global__ void __launch_bounds__(THREADS) gr_norm_fast_kernel(GrMulti m);   // below, with the AMD fast path
 __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m);
+__global__ void __launch_bounds__(THREADS, 3) gr_up_fast_lr_kernel(GrMulti m);
+// ar opt-in STRATA_GR_UP_LR=1: the fast up read as gr_up_fast_lr_kernel (bitwise the same sums, 3 blocks a SM)
+const bool g_gr_up_lr = [] { const char* v = std::getenv("STRATA_GR_UP_LR"); return v && v[0] == '1'; }();
 }  // namespace
 static bool gr_fast();
 namespace {
@@ -923,7 +926,8 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
 #if STRATA_GR_FAST_BUILD
-    if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    if (fast && g_gr_up_lr) gr_up_fast_lr_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    else if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
 #endif
     switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
@@ -1025,7 +1029,12 @@ __device__ __forceinline__ float xor8(float v) {
 #endif
     return v;
 }
-__global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
+// LOWREG (ar opt-in STRATA_GR_UP_LR=1, gr_up_fast_lr_kernel at 3 blocks a SM): the weights stay packed across the
+// token loop (an empty asm per token keeps the compiler from holding 80 unpacked floats) and each chunk's
+// activations are loaded next to their use; every row's dots, their sum and the xor tree are the same ops on the
+// same operands, so the sums are bitwise those of gr_up_fast_kernel
+template<bool LOWREG>
+__device__ __forceinline__ void gr_up_fast_body(const GrMulti& m) {
     __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
     __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
     const int t = threadIdx.x, j = t & 7, grp = t >> 3;
@@ -1055,6 +1064,51 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
     // a token's 5 activation chunks are read from shared memory once for both rows (was once a row); each row's
     // dots are the same dot8 FMAs on the same operands in the same order, so the sums are bitwise unchanged
     float mine[2] = {0.0f, 0.0f};
+    if constexpr (LOWREG) {
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+#if !defined(__HIPCC__)
+#pragma unroll
+            for (int p = 0; p < 2; ++p)
+#pragma unroll
+                for (int q = 0; q < 5; ++q)
+                    asm volatile("" : "+r"(w[p][q].x), "+r"(w[p][q].y), "+r"(w[p][q].z), "+r"(w[p][q].w));
+#endif
+            const float4* l4 = reinterpret_cast<const float4*>(lo[k]);
+            float p0[2], p1[2], p2[2], p3[2];
+            {
+                const float4 a0 = l4[2 * j], a1 = l4[2 * j + 1];
+#pragma unroll
+                for (int p = 0; p < 2; ++p) p0[p] = dot8u(unpack8(w[p][0]), a0, a1);
+            }
+            {
+                const float4 f0 = l4[2 * (32 + j)], f1 = l4[2 * (32 + j) + 1];
+#pragma unroll
+                for (int p = 0; p < 2; ++p) p0[p] = p0[p] + dot8u(unpack8(w[p][4]), f0, f1);
+            }
+            {
+                const float4 b0 = l4[2 * (j + 8)], b1 = l4[2 * (j + 8) + 1];
+#pragma unroll
+                for (int p = 0; p < 2; ++p) p1[p] = dot8u(unpack8(w[p][1]), b0, b1);
+            }
+            {
+                const float4 c0 = l4[2 * (j + 16)], c1 = l4[2 * (j + 16) + 1];
+#pragma unroll
+                for (int p = 0; p < 2; ++p) p2[p] = dot8u(unpack8(w[p][2]), c0, c1);
+            }
+            {
+                const float4 e0 = l4[2 * (j + 24)], e1 = l4[2 * (j + 24) + 1];
+#pragma unroll
+                for (int p = 0; p < 2; ++p) p3[p] = dot8u(unpack8(w[p][3]), e0, e1);
+            }
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const float s = xor8((p0[p] + p2[p]) + (p1[p] + p3[p]));
+                if (j == k) mine[p] = s;
+            }
+        }
+    } else {
 #pragma unroll
     for (int k = 0; k < kFusedGrMaxT; ++k) {
         if (k >= T) break;
@@ -1073,6 +1127,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
             const float s = xor8((p0 + p2) + (p1 + p3));   // stage 16: (j, j+16), (j+8, j+24); stage 8; then 4, 2, 1
             if (j == k) mine[p] = s;
         }
+    }
     }
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
@@ -1097,6 +1152,8 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
     }
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE, as gr_up_multi_kernel
 }
+__global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) { gr_up_fast_body<false>(m); }
+__global__ void __launch_bounds__(THREADS, 3) gr_up_fast_lr_kernel(GrMulti m) { gr_up_fast_body<true>(m); }
 #endif
 
 #if defined(STRATA_HIP_GFX906)
@@ -1771,7 +1828,8 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             m);
         gr_down_finish_kernel<<<(unsigned) ((n_tok * GS_ROWS + 255) / 256), 256, 0, st>>>(m);
         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
-        if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        if (fast && g_gr_up_lr) gr_up_fast_lr_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        else if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
         else gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
@@ -2022,6 +2080,7 @@ void gr_occupancy_report() {
     rep("gr_down_staged_kernel T4", (const void*) gr_down_staged_kernel<4, true>, 4 * per_tok);
 #if STRATA_GR_FAST_BUILD
     rep("gr_up_fast_kernel", (const void*) gr_up_fast_kernel, 0);
+    rep("gr_up_fast_lr_kernel", (const void*) gr_up_fast_lr_kernel, 0);
 #endif
 }
 #endif

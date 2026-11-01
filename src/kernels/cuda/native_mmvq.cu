@@ -679,6 +679,11 @@ __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
     return q6_q8_dot_impl(vl, vh, u, w->scales + scale_offset, w->d, d8);
 }
 
+// ar opt-in STRATA_MMVQ1_WARP=1: one-column Q6_K / Q8_0 GEMVs (the MTP draft) as one warp a row: lane l keeps the
+// four sums the block's warps v = 0..3 kept (thread 32 v + l's blocks in the same order) and adds them as the
+// partials were added, ((t0 + t1) + t2) + t3, then the same warp_sum: bitwise the 4-warp row, without smem or a barrier
+static const bool g_mmvq1_warp = [] { const char* v = std::getenv("STRATA_MMVQ1_WARP"); return v && v[0] == '1'; }();
+
 // Q6_K generic MMVQ: QK=256, QI=32, VDR=1, four blocks per iteration.
 template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
@@ -716,6 +721,31 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
         tmp[i] = warp_sum(tmp[i]);
         if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
     }
+}
+
+// native_q6_k_mmvq_kernel<false>, one warp a row (g_mmvq1_warp): t[v] is warp v's tmp
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_q6_k_mmvq_warp_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                             float* __restrict__ y, int n_in, int n_out) {
+    const int row = WARPS * int(blockIdx.x) + int(threadIdx.y);
+    if (row >= n_out) return;
+    const int lane = int(threadIdx.x);
+    const int blocks_per_row = n_in / 256;
+    float t[WARPS];
+#pragma unroll
+    for (int v = 0; v < WARPS; ++v) t[v] = 0.0f;
+    for (int m = 0; m < blocks_per_row; m += WARPS) {
+#pragma unroll
+        for (int v = 0; v < WARPS; ++v) {
+            const int kbx = m + v;
+            if (kbx < blocks_per_row) t[v] += q6_q8_dot(w + std::size_t(row) * blocks_per_row + kbx, x + kbx * 8, lane);
+        }
+    }
+    float s = t[0];
+#pragma unroll
+    for (int v = 1; v < WARPS; ++v) s += t[v];
+    s = warp_sum(s);
+    if (lane == 0) y[row] = s;
 }
 
 // The four 32-element formats use native two-byte loads and VDR=2. The affine
@@ -827,6 +857,35 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
         tmp[i] = warp_sum(tmp[i]);
         if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
     }
+}
+
+// native_small_mmvq_kernel<..., false>, one warp a row (g_mmvq1_warp): t[v] is warp v's tmp
+template<typename Weight, int Qi>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_small_mmvq_warp_kernel(const Weight* __restrict__ w, const Q81Block* __restrict__ x,
+                                              float* __restrict__ y, int n_in, int n_out) {
+    constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
+    const int row = WARPS * int(blockIdx.x) + int(threadIdx.y);
+    if (row >= n_out) return;
+    const int lane = int(threadIdx.x);
+    const int blocks_per_row = n_in / 32;
+    float t[WARPS];
+#pragma unroll
+    for (int v = 0; v < WARPS; ++v) t[v] = 0.0f;
+    for (int m = 0; m < blocks_per_row; m += BLOCKS_PER_ITER) {
+#pragma unroll
+        for (int v = 0; v < WARPS; ++v) {
+            const int tid = WARP * v + lane;
+            const int kbx = m + tid / (Qi / 2);
+            if (kbx < blocks_per_row)
+                t[v] += small_q8_dot(w + std::size_t(row) * blocks_per_row + kbx, x + kbx, 2 * (tid % (Qi / 2)));
+        }
+    }
+    float s = t[0];
+#pragma unroll
+    for (int v = 1; v < WARPS; ++v) s += t[v];
+    s = warp_sum(s);
+    if (lane == 0) y[row] = s;
 }
 
 // ============================ plan v0.3 P3: ncols = 2..8 (speculative verify, small batches) ============================
@@ -1631,6 +1690,9 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     if (n_in / 32 < 2 * WARPS * WARP / Qi) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
         native_small_mmvq_kernel<Weight, Qi, true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+    } else if (g_mmvq1_warp) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        native_small_mmvq_warp_kernel<Weight, Qi><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
     } else {
         native_small_mmvq_kernel<Weight, Qi, false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
@@ -2334,6 +2396,9 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     if (n_in / 256 < WARPS * WARP / 32) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
         native_q6_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+    } else if (g_mmvq1_warp) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        native_q6_k_mmvq_warp_kernel<<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
     } else {
         native_q6_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
@@ -2786,6 +2851,8 @@ void gpu_read_bw_probe() {
         rep("il IQ4_XS nc3 r1", (const void*) native_mmvq_il_kernel<IlIQ4XS, 3, 1>);
         rep("plain Q6_K 1 column (draft head)", (const void*) native_q6_k_mmvq_kernel<false>);
         rep("plain Q8_0 1 column (MTP dense)", (const void*) native_small_mmvq_kernel<Q80Block, 8, false>);
+        rep("plain Q6_K 1 column, warp a row", (const void*) native_q6_k_mmvq_warp_kernel);
+        rep("plain Q8_0 1 column, warp a row", (const void*) native_small_mmvq_warp_kernel<Q80Block, 8>);
         iq_decode_occupancy_report();
         gr_occupancy_report();
     }
