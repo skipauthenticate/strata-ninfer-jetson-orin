@@ -483,6 +483,23 @@ bool MtpDrafter::top2_env() {
     return on;
 }
 
+bool MtpDrafter::cum_ok(int j, float cum) {
+    static const std::vector<float> th = [] {
+        std::vector<float> v;
+        if (const char* e = std::getenv("STRATA_SPEC_CUM"))
+            for (const char* s = e; *s;) {
+                char* end = nullptr;
+                const float x = std::strtof(s, &end);
+                if (end == s) break;
+                v.push_back(x);
+                s = *end == ',' ? end + 1 : end;
+            }
+        return v;
+    }();
+    if (th.empty() || j < 0) return true;
+    return cum >= th[(size_t) std::min<int>(j, (int) th.size() - 1)];
+}
+
 // STRATA_MTP_TOP2=1 (a diagnostic for tree drafts): draft j's runner-up under the draft layer, from the head logits
 // the step just wrote (row 0), on the host.  Slow; only for measuring what a second branch would have caught.
 void MtpDrafter::record_top2(int j) {
@@ -1400,7 +1417,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
         n = 1;
-        for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+        float cum = pj;   // STRATA_SPEC_CUM: draft j is needed only if draft j - 1 joins the window
+        for (int j = 1; j < max_steps && pj >= min_p && cum_ok(j - 1, cum); ++j) {
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
@@ -1411,6 +1429,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;
+            cum *= pj;
             ++n;
         }
         prefetch_ple(drafts[n - 1]);

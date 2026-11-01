@@ -10547,6 +10547,8 @@ int main(int argc, char** argv) {
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
+            // STRATA_DECODE_TIMING: windows by size T - count, drafts accepted, verify ms, round ms (verify+commit+draft)
+            double byT_n[9] = {}, byT_acc[9] = {}, byT_ver[9] = {}, byT_round[9] = {};
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
             strata::spec::PromptLookupSource lookup_src(sfx);
             static const bool chain_fixed = std::getenv("STRATA_LOOKUP_CHAIN_FIXED") != nullptr;   // no policy gate
@@ -11431,7 +11433,12 @@ int main(int argc, char** argv) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    float cum = 1.0f;   // STRATA_SPEC_CUM (opt-in): the drafts' joint probability gates them too
+                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p &&
+                           strata::core::MtpDrafter::cum_ok(T - 1, cum * dprob[(size_t) T - 1])) {
+                        cum *= dprob[(size_t) T - 1];
+                        ++T;
+                    }
                 }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -11655,6 +11662,12 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (dec_timing && timed_round && !eos && T >= 1 && T <= 8) {
+                    byT_n[T] += 1.0;
+                    byT_acc[T] += a;
+                    byT_ver[T] += std::chrono::duration<double, std::milli>(tw1 - tw0).count();
+                    byT_round[T] += std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+                }
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
@@ -11684,6 +11697,15 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                std::string byT;
+                for (int t = 1; t <= 8; ++t)
+                    if (byT_n[t] > 0) {
+                        char b[96];
+                        std::snprintf(b, sizeof b, " T%d: %.0f win, %.2f acc, verify %.2f, round %.2f ms |", t, byT_n[t],
+                                      byT_acc[t] / byT_n[t], byT_ver[t] / byT_n[t], byT_round[t] / byT_n[t]);
+                        byT += b;
+                    }
+                std::fprintf(stderr, "strata decode by window size:%s\n", byT.c_str());
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;

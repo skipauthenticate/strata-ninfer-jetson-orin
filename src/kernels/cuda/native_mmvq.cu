@@ -1545,9 +1545,9 @@ void launch_il(const void* weights, const void* x_il, float* y, int n_in, int n_
     const float* xd = parts.d;
     switch (ncols) {
 #define STRATA_IL_CASE(N) case N: native_mmvq_il_kernel<I, N, R><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); break;
-        STRATA_IL_CASE(2) STRATA_IL_CASE(3) STRATA_IL_CASE(4)
+        STRATA_IL_CASE(2) STRATA_IL_CASE(3) STRATA_IL_CASE(4) STRATA_IL_CASE(5) STRATA_IL_CASE(6)
 #undef STRATA_IL_CASE
-        default: throw std::invalid_argument("native_mmvq_il requires 2 <= ncols <= 4");
+        default: throw std::invalid_argument("native_mmvq_il requires 2 <= ncols <= 6");
     }
 }
 
@@ -2556,9 +2556,15 @@ std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
     return std::size_t(n_in / Q8K) * std::size_t(native_q8_1_il_cp(ncols)) * (16 * sizeof(int) + sizeof(float));
 }
 
+int native_mmvq_il_max_cols() {
+    static const int m = [] { const char* v = std::getenv("STRATA_IL56"); return v != nullptr && v[0] == '1' ? 6 : 4; }();
+    return m;
+}
+
 void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols, void* stream) {
     validate_shape(n_in, ncols);
-    if (ncols < 2 || ncols > 4) throw std::invalid_argument("native_q8_1_interleave requires 2 <= ncols <= 4");
+    if (ncols < 2 || ncols > native_mmvq_il_max_cols())
+        throw std::invalid_argument("native_q8_1_interleave requires 2 <= ncols <= 4 (6 with STRATA_IL56=1)");
     validate_pointer(x_q8_1);
     validate_pointer(x_il);
     validate_stream(stream);
@@ -2639,7 +2645,8 @@ const std::vector<IlEnvRow>& il_env_rows() {
 // The rows a warp for a card of compute capability `cc` (major * 10 + minor); 0: native_mmvq's kernels.  Pure, so a test
 // can check every architecture's table without that card.
 int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
-    if (ncols < 2 || ncols > 4) return 0;
+    if (ncols < 2 || ncols > 6) return 0;
+    if (ncols > 4) ncols = 4;   // STRATA_IL56: 5-6 columns take the 4-column row (bitwise either way: speed only)
     const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
     for (const IlEnvRow& e : il_env_rows())
         if (e.type == type && e.ncols == ncols) return e.r[cls];
@@ -2690,7 +2697,7 @@ bool il_arch_ok() {
 }  // namespace
 
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
-    if (ncols < 2 || ncols > 4 || !g_multi_exact || !il_arch_ok()) return false;
+    if (ncols < 2 || ncols > native_mmvq_il_max_cols() || !g_multi_exact || !il_arch_ok()) return false;
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14);
 }
@@ -2723,6 +2730,7 @@ void native_q8_1_interleave(const void*, void*, int, int, void*) {
     throw std::invalid_argument("native_q8_1_interleave is CUDA only");
 }
 bool native_mmvq_il_supported(int, int, int) { return false; }
+int native_mmvq_il_max_cols() { return 4; }
 int native_mmvq_il_rows_for(int, int, int, int) { return 0; }
 void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void*, float* y, int n_in, int n_out,
                     int ncols, void* stream) {

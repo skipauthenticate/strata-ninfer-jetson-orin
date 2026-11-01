@@ -61,6 +61,9 @@ public:
     void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
     /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
     static bool top2_env();
+    /// ar opt-in STRATA_SPEC_CUM="t0,t1,..": besides --spec-min-p, draft j joins the window only while the product of
+    /// drafts 0..j's probabilities `cum` is >= t_j (the last value repeats); unset = always true. Drafting policy only.
+    static bool cum_ok(int j, float cum);
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
