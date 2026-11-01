@@ -238,6 +238,13 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    /// ar opt-in STRATA_MTP_EXPERTS=<gguf>: the routed experts in their GGUF type (Q4_0 / Q8_0 ...), computed by
+    /// native_expert_grouped; -1 = rt/experts.bin's Q2_0 blobs (the default)
+    int exp_gu_type_ = -1, exp_d_type_ = -1;
+    int64_t exp_blob_ = 0;                   ///< bytes per expert blob in experts_
+    uint8_t* nat_xq_ = nullptr;              ///< STRATA_MTP_EXPERTS: q8_1 rows of mixed_
+    void* nat_scratch_ = nullptr;
+    bool load_gguf_experts(const std::string& path, const ModelGeometry& g, std::string& err);
     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;
