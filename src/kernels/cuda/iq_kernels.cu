@@ -3510,6 +3510,11 @@ bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 
+// ar diagnostic (verify.cpp under STRATA_VERIFY_PROFILE): a GPU stamp between gate/up+SwiGLU and the down launch
+void gpu_stamp(unsigned long long* buf, int i, void* stream);
+unsigned long long* g_exp_stamp_buf = nullptr;
+int g_exp_stamp_i = 0;
+
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
@@ -3641,6 +3646,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     check("native_expert_grouped/swiglu");
     }
+    if (g_exp_stamp_buf != nullptr) gpu_stamp(g_exp_stamp_buf, g_exp_stamp_i, s);
     if (g_exp_phase == 1) return;
     const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);

@@ -58,6 +58,8 @@
 #include <exception>
 #include "strata/platform/cpu_relax.hpp"
 
+namespace strata::kernels { extern unsigned long long* g_exp_stamp_buf; extern int g_exp_stamp_i; }   // iq_kernels.cu
+
 namespace strata::core {
 namespace {
 
@@ -2312,7 +2314,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // ar opt-in STRATA_VRAM_GY=N: N block rows striding over the VRAM groups instead of cap rows (most of
             // which exit at once); every output still comes from one thread group with the same code (grouped parity)
             static const int64_t vram_gy = [] { const char* v = std::getenv("STRATA_VRAM_GY"); return v ? (int64_t) std::atoll(v) : 0; }();
+            strata::kernels::g_exp_stamp_buf = (prof_on_ && grp == 0) ? prof_ : nullptr;   // ar: stamp 32 = gate/up end
+            strata::kernels::g_exp_stamp_i = (int) (l * kProfPer + 32);
             grouped(p_ptr, p_start, p_counts, vram_gy, hit_out);
+            strata::kernels::g_exp_stamp_buf = nullptr;
             stamp(l, 20, grp);
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
@@ -2555,9 +2560,10 @@ std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
-                                          "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
-                                          "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "", ""};
+                                          "attention", "gate", "", "out-proj", "hc1 up+router+top10+pub", "shared+quant",
+                                          "waitA", "VRAM hits down", "waitB", "PCIe grp", "waitCPU", "copy+combine",
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm",
+                                          "  hc1 down", "  hits gate/up+swiglu"};
     std::string out;
     char b[80];
     double total = 0;
@@ -2826,6 +2832,19 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
             prof_sum_[kind][28] += dd;      //           down
             prof_sum_[kind][29] += du;      //           up (through both halves, as before)
             prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
+        }
+        // ar diagnostic: hc-read1's norm (16 -> 30) and down (30 -> 31) out of stage 17; experts' gate/up+SwiGLU
+        // (19 -> 32) out of the VRAM hits (what stays there is the down launch)
+        const double n1 = gap(at(l, 30), at(l, 16)), d1 = gap(at(l, 31), at(l, 30)), r1 = gap(at(l, 17), at(l, 31));
+        if (n1 > 0 && d1 > 0 && r1 > 0) {
+            prof_sum_[kind][30] += n1;
+            prof_sum_[kind][31] += d1;
+            prof_sum_[kind][17] -= n1 + d1;
+        }
+        const double gu = gap(at(l, 32), at(l, 19)), dn2 = gap(at(l, 20), at(l, 32));
+        if (gu > 0 && dn2 > 0) {
+            prof_sum_[kind][32] += gu;
+            prof_sum_[kind][20] -= gu;
         }
     }
     if (le_ == L) prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
