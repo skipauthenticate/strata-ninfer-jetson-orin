@@ -224,7 +224,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
 // run on gfx103x (RDNA2), with 8 cells per step and the butterfly's lane exchanges in registers (DPP / permlanex16)
 // instead of ds_bpermute: there the score loop is bound by the LDS pipe (the q reads and ds_bpermute share it), not by
 // occupancy - 8 cells per step at 7 waves/SIMD beat 1 cell at 9.  Every other card keeps exactly the kernel above.
-#if defined(STRATA_EXPERIMENTAL_SM60) || (defined(__HIPCC__) && !defined(STRATA_HIP_GFX906))
+// (CUDA: built for every card since autoresearch e077, so STRATA_ATTN_PRE75=1 can A/B it on sm_75+ too)
+#if defined(STRATA_EXPERIMENTAL_SM60) || !defined(__HIPCC__) || !defined(STRATA_HIP_GFX906)
 #define STRATA_ATTN_PRE75_BUILT 1
 #endif
 #if defined(STRATA_ATTN_PRE75_BUILT)
@@ -484,7 +485,7 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
 
 #if defined(STRATA_ATTN_PRE75_BUILT)
 // CUDA: the current device is below sm_75; HIP: it is gfx103x (per device: a layer split can mix cards).
-// STRATA_ATTN_PRE75=0 turns PR #540's kernel off (A/B); on HIP =1 also runs it on another wave32 card.
+// STRATA_ATTN_PRE75=0 turns PR #540's kernel off (A/B); on HIP =1 also runs it on another wave32 card, on CUDA on sm_75+.
 bool pre75_attn() {
     static const int env = [] {
         const char* e = std::getenv("STRATA_ATTN_PRE75");
@@ -511,7 +512,7 @@ bool pre75_attn() {
         }
         cc[dev] = 10 * major + minor;
     }
-    return cc[dev] < 75;
+    return env == 1 || cc[dev] < 75;
 #endif
 }
 #if defined(__HIPCC__)
@@ -524,6 +525,26 @@ bool pre75_attn() {
 #endif
 
 }  // namespace
+
+#if !defined(__HIPCC__)
+// ar diagnostic (STRATA_BW_PROBE=1, called by gpu_read_bw_probe): registers and resident blocks a SM of the INT8-KV
+// decode attention kernels
+void attn_occupancy_report() {
+    const auto rep = [](const char* name, const void* f) {
+        cudaFuncAttributes a{};
+        int blocks = 0;
+        if (cudaFuncGetAttributes(&a, f) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, f, THREADS, 0) != cudaSuccess) {
+            cudaGetLastError();
+            return;
+        }
+        std::fprintf(stderr, "strata bw-probe: %s: %d registers, %zu B static smem, %zu B local, %d blocks of 256 a SM\n",
+                     name, a.numRegs, a.sharedSizeBytes, a.localSizeBytes, blocks);
+    };
+    rep("attn_chunk_kernel q8", (const void*) attn_chunk_kernel<1>);
+    rep("attn_chunk_kernel_pre75 q8", (const void*) attn_chunk_kernel_pre75<1>);
+}
+#endif
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {

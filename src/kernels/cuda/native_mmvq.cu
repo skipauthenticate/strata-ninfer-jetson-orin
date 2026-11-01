@@ -2780,6 +2780,7 @@ __global__ void clk_spin_kernel(long long cycles, unsigned* out) {
 #if !defined(__HIPCC__)
 void iq_decode_occupancy_report();   // iq_kernels.cu
 void gr_occupancy_report();          // fused_gr.cu
+void attn_occupancy_report();        // qsa_decode_attn.cu
 #endif
 void gpu_read_bw_probe() {
     const char* e = std::getenv("STRATA_BW_PROBE");
@@ -2855,6 +2856,7 @@ void gpu_read_bw_probe() {
         rep("plain Q8_0 1 column, warp a row", (const void*) native_small_mmvq_warp_kernel<Q80Block, 8>);
         iq_decode_occupancy_report();
         gr_occupancy_report();
+        attn_occupancy_report();
     }
 #endif
     const auto run = [&](int u, int blocks_per_sm) {
