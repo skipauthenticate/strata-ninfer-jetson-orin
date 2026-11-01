@@ -1514,7 +1514,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (probs) probs[0] = pj;
         n = 1;
         float cum = pj;   // STRATA_SPEC_CUM: draft j is needed only if draft j - 1 joins the window
-        for (int j = 1; j < max_steps && pj >= min_p && cum_ok(j - 1, cum); ++j) {
+        // ... and only if draft j can still join: its joint probability is cum * p_j <= cum, so cum below draft j's
+        // threshold means the step's draft would be cut anyway (same windows, one draft step less)
+        for (int j = 1; j < max_steps && pj >= min_p && cum_ok(j - 1, cum) && cum_ok(j, cum); ++j) {
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
