@@ -147,6 +147,9 @@ public:
     // ar (printed with STRATA_DECODE_TIMING): draft() up to draft 0 (the round graph: T catch-up rows + draft 0) by T,
     // and the chain steps after it
     double ms_first_T[9] = {}, n_first_T[9] = {}, ms_chain = 0, n_chain = 0;
+    // ar STRATA_DRAFT_PROFILE=1: GPU stamps inside the round and step graphs; per-piece ms by catch-up T and for the
+    // chain steps, returned (and reset) by draft_profile_report() ("" when off)
+    std::string draft_profile_report();
 
     /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
     /// state, the first cell a round can still read, its device, and a wait for its own stream.
@@ -174,6 +177,13 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
+    // STRATA_DRAFT_PROFILE (ar, timing only): graph g's stamps at dprof_[g * 20 + i] (g 0 = round, j = step j)
+    void dstamp(int i, cudaStream_t cs);
+    void dprof_alloc();
+    void dprof_collect(int T, int n);
+    unsigned long long* dprof_ = nullptr;
+    int dprof_g_ = -1;   ///< the graph being captured (-1: no stamps, e.g. the prefill graphs)
+    double dprof_round_[9][20] = {}, dprof_round_n_[9] = {}, dprof_step_[20] = {}, dprof_step_n_ = 0;
     cudaGraphExec_t step_exec_[9] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index

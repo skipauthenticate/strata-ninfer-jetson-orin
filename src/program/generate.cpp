@@ -11588,6 +11588,14 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                // ar STRATA_COMMIT_FIRST=1: the commit graph finishes before the draft round starts (ordering only:
+                // the drafter reads none of what the commit writes); its wait lands in "commit/emit" of the timing line
+                static const bool commit_first = [] { const char* v = std::getenv("STRATA_COMMIT_FIRST"); return v && v[0] == '1'; }();
+                if (commit_first && !ver.wait_commit(err)) {
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 if (o.adapt_accepted_only && !drive.d.usage_rows.empty()) {
                     if (!strata::spec::commit_accepted_usage(drive.d.usage, drive.d.usage_rows,
                                                               (size_t) T, (size_t) publish_n)) {
@@ -11719,6 +11727,8 @@ int main(int argc, char** argv) {
                     for (int t = 0; t < 9; ++t) { mtp.ms_first_T[t] = 0; mtp.n_first_T[t] = 0; }
                     mtp.ms_chain = 0;
                     mtp.n_chain = 0;
+                    const std::string dp = mtp.draft_profile_report();
+                    if (!dp.empty()) std::fprintf(stderr, "%s\n", dp.c_str());
                 }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
