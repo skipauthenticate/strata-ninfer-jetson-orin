@@ -1243,6 +1243,15 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 // has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
 constexpr int GRP_NC = 4;
 
+// s[t] as a select chain: a dynamic index would put s in local memory (ptxas: 48 B local in the grouped kernels)
+template<int NC>
+__device__ __forceinline__ float lane_pick(const float (&s)[NC], int t) {
+    float v = s[0];
+#pragma unroll
+    for (int c = 1; c < NC; ++c) v = t == c ? s[c] : v;
+    return v;
+}
+
 template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, bool SUB16 = true>
 __global__ void __launch_bounds__(256, 5) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
@@ -1278,17 +1287,17 @@ __global__ void __launch_bounds__(256, 5) native_gu_multi_kernel(const unsigned 
                         const int off2[2] = { ent_tok[e] * 80, ent_tok[e + 1] * 80 };
                         float s2[2];
                         row_dot_80_sub16<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, t, s2, s_grid);
-                        if (t < 2) dst[(size_t) (e + t) * L.n_ff + r] = s2[t];
+                        if (t < 2) dst[(size_t) (e + t) * L.n_ff + r] = lane_pick(s2, t);
                     } else if (n == 3) {
                         const int off3[3] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80 };
                         float s3[3];
                         row_dot_80_sub16<TG, 3, true, STAGE_GRID>(wr, xq, off3, 3, t, s3, s_grid);
-                        if (t < 3) dst[(size_t) (e + t) * L.n_ff + r] = s3[t];
+                        if (t < 3) dst[(size_t) (e + t) * L.n_ff + r] = lane_pick(s3, t);
                     } else {
                         const int off4[4] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80, ent_tok[e + 3] * 80 };
                         float s4[4];
                         row_dot_80_sub16<TG, 4, true, STAGE_GRID>(wr, xq, off4, 4, t, s4, s_grid);
-                        if (t < 4) dst[(size_t) (e + t) * L.n_ff + r] = s4[t];
+                        if (t < 4) dst[(size_t) (e + t) * L.n_ff + r] = lane_pick(s4, t);
                     }
                 }
             }
@@ -1402,17 +1411,17 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                             const int off2[2] = { 0, 20 };
                             float s2[2];
                             row_dot_40_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
-                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t];
+                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = lane_pick(s2, t);
                         } else if (n == 3) {
                             const int off3[3] = { 0, 20, 40 };
                             float s3[3];
                             row_dot_40_sub8<TD, 3, true>(wr, s_hq, off3, 3, t, s3);
-                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t];
+                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = lane_pick(s3, t);
                         } else {
                             const int off4[4] = { 0, 20, 40, 60 };
                             float s4[4];
                             row_dot_40_sub8<TD, 4, true>(wr, s_hq, off4, 4, t, s4);
-                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t];
+                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = lane_pick(s4, t);
                         }
                     }
                 }
@@ -1446,17 +1455,17 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                             const int off2[2] = { 0, 20 };
                             float s2[2];
                             row_dot_20_sub16<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
-                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t];
+                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = lane_pick(s2, t);
                         } else if (n == 3) {
                             const int off3[3] = { 0, 20, 40 };
                             float s3[3];
                             row_dot_20_sub16<TD, 3, true>(wr, s_hq, off3, 3, t, s3);
-                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t];
+                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = lane_pick(s3, t);
                         } else {
                             const int off4[4] = { 0, 20, 40, 60 };
                             float s4[4];
                             row_dot_20_sub16<TD, 4, true>(wr, s_hq, off4, 4, t, s4);
-                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t];
+                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = lane_pick(s4, t);
                         }
                     }
                 }

@@ -1425,7 +1425,7 @@ struct IlQ6K {
 };
 
 template <typename I, int NC, int R>
-__launch_bounds__(4 * WARP)
+__launch_bounds__(4 * WARP, (R == 1 ? 8 : 1))   // ar: rows 1 <= 64 registers (Q6_K nc4 r1 70 -> 8 blocks)
 __global__ void native_mmvq_il_kernel(const typename I::F::Block* __restrict__ w, const int* __restrict__ xq,
                                       const float* __restrict__ xd, float* __restrict__ y, int n_in, int n_out) {
     using F = typename I::F;
