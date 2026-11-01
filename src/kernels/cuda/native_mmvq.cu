@@ -2670,6 +2670,27 @@ __global__ void bw_read_kernel(const uint4* __restrict__ p, size_t n, unsigned* 
     for (; i < n; i += stride) { const uint4 v = __ldg(p + i); acc ^= v.x ^ v.y ^ v.z ^ v.w; }
     if (acc == 0x9e3779b9u) out[0] = acc;   // keeps the loads
 }
+__device__ __forceinline__ unsigned bw_fold(uint4 v) { return v.x ^ v.y ^ v.z ^ v.w; }
+__device__ __forceinline__ unsigned bw_fold(unsigned v) { return v; }
+__device__ __forceinline__ unsigned bw_fold(unsigned short v) { return v; }
+// The GEMV pattern: one warp a row (128-thread blocks, as the IL kernel), lanes stride the row in V-sized loads, U in flight
+template <typename V, int U>
+__global__ void bw_rows_kernel(const V* __restrict__ p, int row_v, int n_rows, unsigned* out) {
+    const int lane = int(threadIdx.x) & 31, row = int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5);
+    if (row >= n_rows) return;
+    const V* r = p + (size_t) row * row_v;
+    unsigned acc = 0;
+    int i = lane;
+    for (; i + 32 * (U - 1) < row_v; i += 32 * U) {
+        V v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) v[u] = __ldg(r + i + 32 * u);
+#pragma unroll
+        for (int u = 0; u < U; ++u) acc ^= bw_fold(v[u]);
+    }
+    for (; i < row_v; i += 32) acc ^= bw_fold(__ldg(r + i));
+    if (acc == 0x9e3779b9u) out[0] = acc;
+}
 }  // namespace
 void gpu_read_bw_probe() {
     const char* e = std::getenv("STRATA_BW_PROBE");
@@ -2707,6 +2728,70 @@ void gpu_read_bw_probe() {
     };
     for (int u : {1, 4, 8})
         for (int bps : {2, 4, 6}) run(u, bps);
+    const auto rows = [&](int row_bytes, int vbytes, int u) {
+        const int n_rows = (int) (bytes / row_bytes), row_v = row_bytes / vbytes;
+        const unsigned g = (unsigned) ((n_rows + 3) / 4);
+        float best_r = 1e30f;
+        for (int rep = 0; rep < 6; ++rep) {
+            cudaEventRecord(a);
+            if (vbytes == 16 && u == 1) bw_rows_kernel<uint4, 1><<<g, 128>>>(buf, row_v, n_rows, out);
+            else if (vbytes == 16) bw_rows_kernel<uint4, 4><<<g, 128>>>(buf, row_v, n_rows, out);
+            else if (vbytes == 4 && u == 1) bw_rows_kernel<unsigned, 1><<<g, 128>>>((const unsigned*) buf, row_v, n_rows, out);
+            else if (vbytes == 4) bw_rows_kernel<unsigned, 4><<<g, 128>>>((const unsigned*) buf, row_v, n_rows, out);
+            else if (u == 1) bw_rows_kernel<unsigned short, 1><<<g, 128>>>((const unsigned short*) buf, row_v, n_rows, out);
+            else bw_rows_kernel<unsigned short, 4><<<g, 128>>>((const unsigned short*) buf, row_v, n_rows, out);
+            cudaEventRecord(b);
+            cudaEventSynchronize(b);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, a, b);
+            if (rep > 0 && ms < best_r) best_r = ms;
+        }
+        const double used = (double) n_rows * row_bytes;
+        std::fprintf(stderr, "strata bw-probe: rows of %d B, a warp a row, %d-byte loads x%d in flight: %.1f GB/s (%.3f ms)\n",
+                     row_bytes, vbytes, u, used / (best_r * 1e6), best_r);
+    };
+    for (int rb : {1104, 2112, 5040})
+        for (int vb : {16, 4, 2})
+            for (int u : {1, 4}) rows(rb, vb, u);
+#if !defined(__HIPCC__)
+    // Launch size: L back-to-back GEMV-pattern launches of `kib` KiB each (2112-byte rows, 4-byte loads), on fresh
+    // parts of the buffer (L2 never holds them), captured in one graph as the decode windows are.
+    cudaStream_t st = nullptr;
+    cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+    for (int kib : {512, 1024, 2048, 4096, 8192, 16384, 32768}) {
+        const int row_bytes = 2112, row_v = row_bytes / 4;
+        const int n_rows = (int) (((size_t) kib << 10) / row_bytes);
+        const size_t span_v = (size_t) n_rows * row_v;
+        const int L = (int) (std::min)(size_t(64), bytes / 4 / span_v);
+        cudaGraph_t gr = nullptr;
+        cudaGraphExec_t ge = nullptr;
+        cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+        for (int l = 0; l < L; ++l)
+            bw_rows_kernel<unsigned, 1><<<(unsigned) ((n_rows + 3) / 4), 128, 0, st>>>(
+                (const unsigned*) buf + (size_t) l * span_v, row_v, n_rows, out);
+        if (cudaStreamEndCapture(st, &gr) != cudaSuccess || cudaGraphInstantiate(&ge, gr, 0) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "strata bw-probe: graph capture failed\n");
+            break;
+        }
+        float best_g = 1e30f;
+        for (int rep = 0; rep < 6; ++rep) {
+            cudaEventRecord(a, st);
+            cudaGraphLaunch(ge, st);
+            cudaEventRecord(b, st);
+            cudaEventSynchronize(b);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, a, b);
+            if (rep > 0 && ms < best_g) best_g = ms;
+        }
+        const double used = (double) L * n_rows * row_bytes;
+        std::fprintf(stderr, "strata bw-probe: graph of %d launches of %d KiB (GEMV rows): %.1f GB/s, %.2f us a launch\n",
+                     L, kib, used / (best_g * 1e6), best_g * 1e3 / L);
+        cudaGraphExecDestroy(ge);
+        cudaGraphDestroy(gr);
+    }
+    cudaStreamDestroy(st);
+#endif
     float best = 1e30f;   // device-to-device copy: bytes read + bytes written
     for (int rep = 0; rep < 6; ++rep) {
         cudaEventRecord(a);
