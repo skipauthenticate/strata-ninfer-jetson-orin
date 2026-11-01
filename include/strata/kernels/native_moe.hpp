@@ -22,6 +22,12 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
 /// moe_hit_add (parts += hit) gave, without the zero fill and the add launch.
 void native_moe_combine_multi_hits(const float* hits, const float* weights, const float* shared, float* output,
                                    int64_t n_embd, int64_t k, int n_tok, void* stream);
+/// ar opt-in STRATA_HIT_COMBINE: k = 10 rows, row r of a token a GPU row when it is in hit_rows[0, *hit_count)
+/// (read as 0.0f + hits[r]) and a CPU row otherwise (cpu_rows[r]): bitwise copy_rows_from_mapped + moe_hit_add +
+/// native_moe_combine_multi, in one launch.
+void native_moe_combine_multi_hits_mapped(const float* hits, const float* cpu_rows, const int32_t* hit_rows,
+                                          const int32_t* hit_count, const float* weights, const float* shared,
+                                          float* output, int64_t n_embd, int n_tok, void* stream);
 /// S26 STRATA_LFUSE: the same with `shared` unscaled and shared_gate[t] the shared expert's raw gate logit: the
 /// row is scaled by sigmoid(shared_gate[t]) here, bitwise what shared_expert_multi's sigmoid + scale gave.
 void native_moe_combine_multi_hits_gated(const float* hits, const float* weights, const float* shared,

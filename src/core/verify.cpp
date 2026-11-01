@@ -2287,6 +2287,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
             }
         };
+        // ar opt-in STRATA_HIT_COMBINE=1: no zero-fill/copy into parts and no moe_hit_add; the combine reads the GPU rows
+        // (as 0.0f + hit) and the CPU rows (mapped) itself, bitwise what those two left in parts
+        static const bool hit_combine_env = [] { const char* v = std::getenv("STRATA_HIT_COMBINE"); return v && v[0] == '1'; }();
+        const bool hit_combine = hit_combine_env && !ar_on() && dec_batch && n > 1 && native_moe_combine_enabled() &&
+                                 !remote_opt_ && !device_plan_ && !sg_gated_[grp] && K == 10 &&
+                                 moe_parts_diag_h_ == nullptr;
         if (ar_on()) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
@@ -2330,13 +2336,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
-                else if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
+                else if (hit_combine) {
+                } else if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
                     copy_rows_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
                                           p_dst, p_counts + 1, cs);
                 else
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
-            moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
+            if (!hit_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
         if (moe_parts_diag_h_ != nullptr && l == moe_parts_diag_layer_ &&
             (!batch_rec_ || moe_parts_diag_include_batch_)) {
@@ -2373,6 +2380,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else if (hit_combine) {
+            try {
+                native_moe_combine_multi_hits_mapped(hit_out, m_ymiss_ + (size_t) tb * K * N, p_dst, p_counts + 1,
+                                                     w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, n, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
