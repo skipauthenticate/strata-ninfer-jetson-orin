@@ -1252,7 +1252,17 @@ __device__ __forceinline__ float lane_pick(const float (&s)[NC], int t) {
     return v;
 }
 
-template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, bool SUB16 = true>
+// ar (STRATA_EXP_PF=1): ask L2 for a block's weight slice [p, p + bytes) of a group it will read next, one prefetch a
+// 32-byte sector; a cache hint only: the kernel's loads, values and order do not change
+__device__ __forceinline__ void l2_prefetch_slice(const uint8_t* p, int bytes) {
+#if !defined(__HIPCC__)
+    const size_t a = __cvta_generic_to_global(p);
+    for (int i = threadIdx.x; i <= (bytes + 31) / 32; i += blockDim.x)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(a + (size_t) min(i * 32, bytes - 1)));
+#endif
+}
+
+template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, bool SUB16 = true, bool PF = false>
 __global__ void __launch_bounds__(256, 5) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
@@ -1273,7 +1283,13 @@ __global__ void __launch_bounds__(256, 5) native_gu_multi_kernel(const unsigned 
             const int r = is_up ? row - (int) L.n_ff : row;
             const size_t w_off = (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
             float* dst = is_up ? up : gate;
+            // the block's 16 rows are one contiguous slice when n_ff % 16 == 0 (no block straddles gate/up)
+            const bool pf = PF && (L.n_ff & 15) == 0;
+            const size_t pf_off = (is_up ? L.up_off : 0) + (size_t) (r - subwarp) * L.gu_row;
+            const int pf_bytes = 16 * (int) L.gu_row;
+            if (pf) l2_prefetch_slice((const uint8_t*) grp_ptr[blockIdx.y] + pf_off, pf_bytes);
             for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+                if (pf && g + (int) gridDim.y < ng) l2_prefetch_slice((const uint8_t*) grp_ptr[g + gridDim.y] + pf_off, pf_bytes);
                 const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
                 const int e0 = grp_start[g], e1 = grp_start[g + 1];
                 for (int e = e0; e < e1; e += GRP_NC) {
@@ -1373,7 +1389,7 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
 }
 
 // native_down_kernel with the entries taken GRP_NC at a time
-template<int TD, bool SUB_DOWN = true>
+template<int TD, bool SUB_DOWN = true, bool PF = false>
 __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
@@ -1391,7 +1407,12 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
             const bool valid_r = (r < L.n_embd);
             const size_t w_off = L.down_off + (size_t) (valid_r ? r : 0) * L.d_row;
             const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+            const int r0 = blockIdx.x * 32;
+            const size_t pf_off = L.down_off + (size_t) r0 * L.d_row;
+            const int pf_bytes = min(32, (int) L.n_embd - r0) * (int) L.d_row;
+            if (PF) l2_prefetch_slice((const uint8_t*) grp_ptr[blockIdx.y] + pf_off, pf_bytes);
             for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+                if (PF && g + (int) gridDim.y < ng) l2_prefetch_slice((const uint8_t*) grp_ptr[g + gridDim.y] + pf_off, pf_bytes);
                 const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
                 const int e0 = grp_start[g], e1 = grp_start[g + 1];
                 for (int e = e0; e < e1; e += GRP_NC) {
@@ -1968,6 +1989,8 @@ bool env_on(const char* name) {
 // STRATA_OLD_IQ_MMVQ=1 keeps the per-column kernels (bitwise equal to the new ones; kept for A/B timing)
 bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
 bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
+// ar: STRATA_EXP_PF=1 L2-prefetches each block's weight slice of its next group (IQ3_S gate/up, IQ4_NL down)
+bool g_exp_pf = env_on("STRATA_EXP_PF");
 // STRATA_IQ_STAGE_GRID=0 disables staging 64-bit i-quant codebook tables into shared memory
 bool g_stage_grid = [] {
     const char* v = std::getenv("STRATA_IQ_STAGE_GRID");
@@ -2692,6 +2715,10 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
         else native_gu_multi_kernel<TG, true, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     } else {
         if (g_no_sub16_gu) native_gu_multi_kernel<TG, false, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else if constexpr (TG == 21) {
+            if (g_exp_pf) native_gu_multi_kernel<TG, false, true, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else native_gu_multi_kernel<TG, false, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        }
         else native_gu_multi_kernel<TG, false, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     }
 }
@@ -2703,6 +2730,10 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_no_sub16_gu) native_down_multi_kernel<TD, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else if constexpr (TD == 20) {
+        if (g_exp_pf) native_down_multi_kernel<TD, true, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else native_down_multi_kernel<TD, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    }
     else native_down_multi_kernel<TD, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
 
@@ -2728,6 +2759,8 @@ void iq_decode_occupancy_report() {
     };
     rep("native_gu_multi_kernel<IQ3_S, sub16>", (const void*) native_gu_multi_kernel<21, false, true>);
     rep("native_down_multi_kernel<IQ4_NL, sub>", (const void*) native_down_multi_kernel<20, true>);
+    rep("native_gu_multi_kernel<IQ3_S, sub16, pf>", (const void*) native_gu_multi_kernel<21, false, true, true>);
+    rep("native_down_multi_kernel<IQ4_NL, sub, pf>", (const void*) native_down_multi_kernel<20, true, true>);
 }
 #endif
 
