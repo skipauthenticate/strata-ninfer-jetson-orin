@@ -1997,5 +1997,33 @@ void fused_gr_check() {
                                    "for the earlier ones)" : "");
 }
 
+#if !defined(__HIPCC__)
+// ar diagnostic (STRATA_BW_PROBE=1, called by gpu_read_bw_probe): registers and resident blocks a SM of the staged
+// hyper-connection read's kernels (norm split, down staged at T 1-4 with its dynamic smem, up fast)
+void gr_occupancy_report() {
+    int tv = 0;
+    down_chunk(true, &tv);   // sets the staged kernels' smem attributes first
+    const auto rep = [](const char* name, const void* f, size_t dsmem) {
+        cudaFuncAttributes a{};
+        int blocks = 0;
+        if (cudaFuncGetAttributes(&a, f) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, f, THREADS, dsmem) != cudaSuccess) {
+            cudaGetLastError();
+            return;
+        }
+        std::fprintf(stderr, "strata bw-probe: %s: %d registers, %zu B static + %zu B dynamic smem, %zu B local, "
+                             "%d blocks of 256 a SM\n", name, a.numRegs, a.sharedSizeBytes, dsmem, a.localSizeBytes, blocks);
+    };
+    const size_t per_tok = (size_t) 2 * H_TILE * sizeof(float);
+    rep("gr_norm_split_kernel", (const void*) gr_norm_split_kernel, 0);
+    rep("gr_down_staged_kernel T1", (const void*) gr_down_staged_kernel<1, true>, per_tok);
+    rep("gr_down_staged_kernel T2", (const void*) gr_down_staged_kernel<2, true>, 2 * per_tok);
+    rep("gr_down_staged_kernel T3", (const void*) gr_down_staged_kernel<3, true>, 3 * per_tok);
+    rep("gr_down_staged_kernel T4", (const void*) gr_down_staged_kernel<4, true>, 4 * per_tok);
+#if STRATA_GR_FAST_BUILD
+    rep("gr_up_fast_kernel", (const void*) gr_up_fast_kernel, 0);
+#endif
+}
+#endif
 
 }  // namespace strata::kernels

@@ -2300,7 +2300,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
             stamp(l, 19, grp);
-            grouped(p_ptr, p_start, p_counts, 0, hit_out);
+            // ar opt-in STRATA_VRAM_GY=N: N block rows striding over the VRAM groups instead of cap rows (most of
+            // which exit at once); every output still comes from one thread group with the same code (grouped parity)
+            static const int64_t vram_gy = [] { const char* v = std::getenv("STRATA_VRAM_GY"); return v ? (int64_t) std::atoll(v) : 0; }();
+            grouped(p_ptr, p_start, p_counts, vram_gy, hit_out);
             stamp(l, 20, grp);
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped

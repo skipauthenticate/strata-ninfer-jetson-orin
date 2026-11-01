@@ -2714,6 +2714,7 @@ __global__ void clk_spin_kernel(long long cycles, unsigned* out) {
 }  // namespace
 #if !defined(__HIPCC__)
 void iq_decode_occupancy_report();   // iq_kernels.cu
+void gr_occupancy_report();          // fused_gr.cu
 #endif
 void gpu_read_bw_probe() {
     const char* e = std::getenv("STRATA_BW_PROBE");
@@ -2782,7 +2783,11 @@ void gpu_read_bw_probe() {
         rep("il Q6_K nc3 r2", (const void*) native_mmvq_il_kernel<IlQ6K, 3, 2>);
         rep("il Q6_K nc4 r2", (const void*) native_mmvq_il_kernel<IlQ6K, 4, 2>);
         rep("il IQ4_XS nc3 r2", (const void*) native_mmvq_il_kernel<IlIQ4XS, 3, 2>);
+        rep("il IQ4_XS nc3 r1", (const void*) native_mmvq_il_kernel<IlIQ4XS, 3, 1>);
+        rep("plain Q6_K 1 column (draft head)", (const void*) native_q6_k_mmvq_kernel<false>);
+        rep("plain Q8_0 1 column (MTP dense)", (const void*) native_small_mmvq_kernel<Q80Block, 8, false>);
         iq_decode_occupancy_report();
+        gr_occupancy_report();
     }
 #endif
     const auto run = [&](int u, int blocks_per_sm) {
