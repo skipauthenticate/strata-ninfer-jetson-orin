@@ -1,0 +1,1 @@
+{"args": {"--kv-grow": true}, "env": {"STRATA_DECODE_TIMING": "1", "STRATA_GR_FAST": "1", "STRATA_GR_DOWN_MAX4": "1"}}
