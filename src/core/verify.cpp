@@ -2578,6 +2578,21 @@ std::string Verifier::profile_report() {
     }
     std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
+    for (int t = 0; t < 8; ++t) {   // ar: the same stages by window size (GDN + QSA layers), ms a window of that T
+        const double n = (double) prof_windows_t_[t];
+        if (n == 0) continue;
+        double tt = 0;
+        for (int i = 0; i < kProfPer; ++i) tt += prof_sum_t_[t][i];
+        std::snprintf(b, sizeof b, " || T%d %lld win total %.2f:", t + 1, (long long) prof_windows_t_[t], tt / 1e6 / n);
+        out += b;
+        for (int i = 0; i < kProfPer; ++i) {
+            if (prof_sum_t_[t][i] <= 0) continue;
+            std::snprintf(b, sizeof b, " %s %.2f", names[i], prof_sum_t_[t][i] / 1e6 / n);
+            out += b;
+        }
+        for (double& d : prof_sum_t_[t]) d = 0;
+        prof_windows_t_[t] = 0;
+    }
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
     return out;
@@ -2808,6 +2823,8 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
     const ModelGeometry& g = *g_;
     const int64_t L = g.n_layers;
     auto at = [&](int64_t l, int i) { return stamps[(size_t) (l * kProfPer + i)]; };
+    double before[2][kProfPer];   // ar: this window's share goes to its T's row too (per-T table)
+    std::memcpy(before, prof_sum_, sizeof before);
     // D8: the derived columns below read stamps the hc-read kernels write themselves or the next
     // layer's first.  A slot no kernel stamped is 0 and its unsigned difference wrapped to ~1e19 ns -
     // which is why (gap)/head/hc0 printed ~1e14 ms per window.  A missing or out-of-order stamp now
@@ -2849,6 +2866,11 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
     }
     if (le_ == L) prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
     ++prof_windows_;
+    if (prof_t_ >= 1 && prof_t_ <= 8) {
+        for (int k = 0; k < 2; ++k)
+            for (int i = 0; i < kProfPer; ++i) prof_sum_t_[prof_t_ - 1][i] += prof_sum_[k][i] - before[k][i];
+        ++prof_windows_t_[prof_t_ - 1];
+    }
 }
 
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
@@ -3378,7 +3400,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
         copy_used_ = false;
     }
-    if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
+    if (prof_on_ && G == 1) { prof_t_ = T; collect_profile(); }   // the window's GPU stage stamps
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
@@ -4766,7 +4788,7 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     fl_active_ = false;
-    if (fl_prof_) accumulate_profile(prof_pin_);
+    if (fl_prof_) { prof_t_ = fl_T_; accumulate_profile(prof_pin_); }
     ++windows;
     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
     if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written

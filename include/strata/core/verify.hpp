@@ -463,6 +463,9 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    int prof_t_ = 0;                          // ar: the profiled window's T (0: not bucketed)
+    double prof_sum_t_[8][kProfPer] = {};     // ar: [T - 1][stage], GDN + QSA layers together
+    int64_t prof_windows_t_[8] = {};
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

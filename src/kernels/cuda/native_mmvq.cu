@@ -1484,7 +1484,8 @@ struct IlQ6K {
 };
 
 template <typename I, int NC, int R>
-__launch_bounds__(4 * WARP, (R == 1 ? 8 : 1))   // ar: rows 1 <= 64 registers (Q6_K nc4 r1 70 -> 8 blocks)
+// ar: rows 1 <= 64 registers (Q6_K nc4 r1 70 -> 8 blocks); 5-6 columns (STRATA_IL56 only) uncapped: 64 spills there
+__launch_bounds__(4 * WARP, (R == 1 && NC <= 4 ? 8 : 1))
 __global__ void native_mmvq_il_kernel(const typename I::F::Block* __restrict__ w, const int* __restrict__ xq,
                                       const float* __restrict__ xd, float* __restrict__ y, int n_in, int n_out) {
     using F = typename I::F;
@@ -2625,7 +2626,7 @@ const std::vector<IlEnvRow>& il_env_rows() {
             if (end == std::string::npos) end = str.size();
             int t = 0, n = 0, r[5] = {0, 0, 0, 0, 0}, used = 0;
             if (std::sscanf(str.substr(pos, end - pos).c_str(), "%d:%d:%d,%d,%d,%d,%d%n", &t, &n, &r[0], &r[1], &r[2], &r[3],
-                            &r[4], &used) >= 7 && n >= 2 && n <= 4) {
+                            &r[4], &used) >= 7 && n >= 2 && n <= 6) {
                 IlEnvRow x{t, n, {}};
                 bool ok = true;
                 for (int i = 0; i < 5; ++i) { ok = ok && (r[i] == 0 || r[i] == 1 || r[i] == 2 || r[i] == 4); x.r[i] = (uint8_t) r[i]; }
@@ -2646,8 +2647,12 @@ const std::vector<IlEnvRow>& il_env_rows() {
 // can check every architecture's table without that card.
 int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
     if (ncols < 2 || ncols > 6) return 0;
-    if (ncols > 4) ncols = 4;   // STRATA_IL56: 5-6 columns take the 4-column row (bitwise either way: speed only)
     const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
+    if (ncols > 4) {   // STRATA_IL56: an env row for 5-6 columns, else the 4-column row (bitwise either way: speed only)
+        for (const IlEnvRow& e : il_env_rows())
+            if (e.type == type && e.ncols == ncols) return e.r[cls];
+        ncols = 4;
+    }
     for (const IlEnvRow& e : il_env_rows())
         if (e.type == type && e.ncols == ncols) return e.r[cls];
     const IlRows* t = kIlRowsShared;
@@ -2856,6 +2861,10 @@ void gpu_read_bw_probe() {
         rep("il Q6_K nc2 r2", (const void*) native_mmvq_il_kernel<IlQ6K, 2, 2>);
         rep("il Q6_K nc3 r2", (const void*) native_mmvq_il_kernel<IlQ6K, 3, 2>);
         rep("il Q6_K nc4 r2", (const void*) native_mmvq_il_kernel<IlQ6K, 4, 2>);
+        rep("il Q6_K nc5 r1", (const void*) native_mmvq_il_kernel<IlQ6K, 5, 1>);
+        rep("il Q6_K nc5 r2", (const void*) native_mmvq_il_kernel<IlQ6K, 5, 2>);
+        rep("il Q6_K nc6 r1", (const void*) native_mmvq_il_kernel<IlQ6K, 6, 1>);
+        rep("il Q5_K nc5 r1", (const void*) native_mmvq_il_kernel<IlQ5K, 5, 1>);
         rep("il IQ4_XS nc3 r2", (const void*) native_mmvq_il_kernel<IlIQ4XS, 3, 2>);
         rep("il IQ4_XS nc3 r1", (const void*) native_mmvq_il_kernel<IlIQ4XS, 3, 1>);
         rep("plain Q6_K 1 column (draft head)", (const void*) native_q6_k_mmvq_kernel<false>);
