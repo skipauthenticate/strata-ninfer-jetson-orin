@@ -1052,21 +1052,31 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
     }
     for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
     __syncthreads();
+    // a token's 5 activation chunks are read from shared memory once for both rows (was once a row); each row's
+    // dots are the same dot8 FMAs on the same operands in the same order, so the sums are bitwise unchanged
+    float mine[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) {
+        if (k >= T) break;
+        const float4* l4 = reinterpret_cast<const float4*>(lo[k]);
+        const float4 a0 = l4[2 * j], a1 = l4[2 * j + 1];                       // chunk j       (old lane j)
+        const float4 b0 = l4[2 * (j + 8)], b1 = l4[2 * (j + 8) + 1];           // chunk j + 8   (old lane j + 8)
+        const float4 c0 = l4[2 * (j + 16)], c1 = l4[2 * (j + 16) + 1];         // chunk j + 16  (old lane j + 16)
+        const float4 e0 = l4[2 * (j + 24)], e1 = l4[2 * (j + 24) + 1];         // chunk j + 24  (old lane j + 24)
+        const float4 f0 = l4[2 * (32 + j)], f1 = l4[2 * (32 + j) + 1];         // chunk 32 + j  (old lane j, 2nd)
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const float p0 = dot8u(unpack8(w[p][0]), a0, a1) + dot8u(unpack8(w[p][4]), f0, f1);
+            const float p1 = dot8u(unpack8(w[p][1]), b0, b1);
+            const float p2 = dot8u(unpack8(w[p][2]), c0, c1);
+            const float p3 = dot8u(unpack8(w[p][3]), e0, e1);
+            const float s = xor8((p0 + p2) + (p1 + p3));   // stage 16: (j, j+16), (j+8, j+24); stage 8; then 4, 2, 1
+            if (j == k) mine[p] = s;
+        }
+    }
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
         const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
-        float mine = 0.0f;
-#pragma unroll
-        for (int k = 0; k < kFusedGrMaxT; ++k) {
-            if (k >= T) break;
-            const float* l = lo[k];
-            const float p0 = dot8(w[p][0], l + j * 8) + dot8(w[p][4], l + (32 + j) * 8);   // old lane j
-            const float p1 = dot8(w[p][1], l + (j + 8) * 8);                               // old lane j + 8
-            const float p2 = dot8(w[p][2], l + (j + 16) * 8);                              // old lane j + 16
-            const float p3 = dot8(w[p][3], l + (j + 24) * 8);                              // old lane j + 24
-            const float s = xor8((p0 + p2) + (p1 + p3));   // stage 16: (j, j+16), (j+8, j+24); stage 8; then 4, 2, 1
-            if (j == k) mine = s;
-        }
         if (j < T) {
             float x0 = rv[p];
             if (apply) {
@@ -1074,7 +1084,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
                 m.a[j].R_out[i] = x0;
             }
             const float x = x0 * wn[p] * rsc[p];
-            g[j][c][dd] = x * sigmoidf_(mine);
+            g[j][c][dd] = x * sigmoidf_(mine[p]);
         }
     }
     __syncthreads();
