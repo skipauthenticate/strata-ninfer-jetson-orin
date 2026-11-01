@@ -3352,7 +3352,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
+        // ar opt-in STRATA_NO_PCIE=1: no PCIe share in decode windows (misses go to the CPU), so verify.cpp skips its launches
+        static const bool no_pcie = [] { const char* v = std::getenv("STRATA_NO_PCIE"); return v && v[0] == '1'; }();
+        const bool pcie_ok = !no_pcie && d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;

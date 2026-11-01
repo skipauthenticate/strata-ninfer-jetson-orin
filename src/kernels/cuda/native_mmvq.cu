@@ -861,7 +861,7 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
 
 // native_small_mmvq_kernel<..., false>, one warp a row (g_mmvq1_warp): t[v] is warp v's tmp
 template<typename Weight, int Qi>
-__launch_bounds__(WARPS * WARP, 1)
+__launch_bounds__(WARPS * WARP, Qi == 8 ? 12 : 1)   // ar: Q8_0 63 -> <= 40 registers, 8 -> 12 blocks a SM
 __global__ void native_small_mmvq_warp_kernel(const Weight* __restrict__ w, const Q81Block* __restrict__ x,
                                               float* __restrict__ y, int n_in, int n_out) {
     constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
