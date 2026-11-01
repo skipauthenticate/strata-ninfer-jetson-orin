@@ -50,5 +50,7 @@ products), `fddcc9a1` and `4ba68980` (`__launch_bounds__` register caps). They w
 - `results.tsv`: every measurement (103 rows).
 - `overrides/`: the settings for each experiment.
 - `base-overrides.json`: the base every run started from.
+- `fast-build/`: how to run IQ3_S with this branch's engine and the best settings, and its verification through
+  the server (33.28 tok/s decode, needles 3/3).
 - `harness/`: the scripts. Host names and paths are replaced with placeholders: `jetson` is an ssh alias for the
   board, and `/home/<user>` is its home directory.

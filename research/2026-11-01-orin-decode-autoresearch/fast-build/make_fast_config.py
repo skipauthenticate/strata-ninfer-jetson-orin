@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""strata-iq3_s-fast.json from setup's strata-iq3_s.json: the decode-speed engine and the overnight best settings
+(e096), without the two diagnostic switches (STRATA_DECODE_TIMING, STRATA_BW_PROBE)."""
+import json
+import sys
+from pathlib import Path
+
+repo, engine, profile = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+cfg = json.loads((repo / "strata-iq3_s.json").read_text())
+args, pairs, i = cfg["args"], [], 0
+while i < len(args):
+    if i + 1 < len(args) and not args[i + 1].startswith("--"):
+        pairs.append([args[i], args[i + 1]]); i += 2
+    else:
+        pairs.append([args[i], None]); i += 1
+set_ = {"--expert-profile": profile, "--adapt-every": "100000", "--kv-grow": None, "--expert-cache": "14629",
+        "--mtp-hnorm": "stream"}
+pairs = [p for p in pairs if p[0] not in set_] + [[k, v] for k, v in set_.items()]
+cfg["args"] = [x for p in pairs for x in p if x is not None]
+cfg["exe"] = engine
+cfg["log"] = str(repo / "strata-iq3_s-fast.log")
+cfg["model_name"] = "qwen3.8-flash-next-iq3_s"
+cfg["env"] = {"STRATA_GR_FAST": "1", "STRATA_DRAFT_VOCAB_TOP": "40960",
+              "STRATA_MMVQ_IL_ROWS": "14:2:0,1,1,1,2;14:3:0,1,1,1,2;14:4:0,1,1,1,2", "STRATA_VRAM_GY": "8",
+              "STRATA_GR_UP_LR": "1", "STRATA_MMVQ1_WARP": "1", "STRATA_NO_PCIE": "1", "STRATA_HIT_COMBINE": "1",
+              "STRATA_ATTN_PRE75": "1", "STRATA_EXP_PF": "1", "STRATA_HC_DOWN_WPB": "21", "STRATA_HC_UP_PF": "48"}
+(repo / "strata-iq3_s-fast.json").write_text(json.dumps(cfg, indent=1) + "\n")
+print(" ".join(cfg["args"]))
