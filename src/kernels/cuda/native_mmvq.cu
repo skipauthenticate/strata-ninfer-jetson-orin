@@ -37,6 +37,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -631,8 +632,15 @@ __global__ void native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
     }
 }
 
+// (float) n for |n| < 2^22 without I2F (16 a clock per SM on sm_8x): n added to the bits of 1.5 * 2^23 is that float
+// plus n exactly, and the subtraction is exact. Same value as the conversion, bit for bit.
+__device__ __forceinline__ float exact_i2f_22(int n) { return __fsub_rn(__int_as_float(0x4B400000 + n), 12582912.0f); }
+
 // Exact pinned vec_dot_q6_K_q8_1: keep signed per-16-element scales,
 // signed-byte subtraction, DP4A order, and the float accumulation sequence.
+// NOI2F (the IL kernel's columns; e043: -0.4 ms a verify window, but the one-column draft head got 0.3 ms slower):
+// the same integers and floats without __vsubss4's emulation and without I2F.
+template <bool NOI2F = false>
 __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __restrict__ u,
                                               const int8_t* __restrict__ scales,
                                               float d, const float* __restrict__ d8) {
@@ -642,8 +650,14 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
         const int sc = scales[4 * i];
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int vi = __vsubss4(vil | vih, 0x20202020);
-        sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
+        if constexpr (NOI2F) {
+            // bytes of vil | vih are 0..63, so byte - 32 never saturates; |dp4a| <= 4 * 32 * 128, |sc| <= 128: <= 2^21
+            const int vi = (((vil | vih) | 0x80808080) - 0x20202020) ^ 0x80808080;
+            sumf += d8[i] * exact_i2f_22(STRATA_DP4A(vi, u[i], 0) * sc);
+        } else {
+            const int vi = __vsubss4(vil | vih, 0x20202020);
+            sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
+        }
     }
     return d * sumf;
 }
@@ -1405,7 +1419,7 @@ struct IlQ6K {
         for (int c = 0; c < NC; ++c) {
             const int uc[2] = {u[0][c], u[1][c]};
             const float dc[2] = {d8[0][c], d8[1][c]};
-            out[c] = q6_q8_dot_impl(r.vl, r.vh, uc, r.scales, r.d, dc);
+            out[c] = q6_q8_dot_impl<true>(r.vl, r.vh, uc, r.scales, r.d, dc);
         }
     }
 };
@@ -2691,7 +2705,16 @@ __global__ void bw_rows_kernel(const V* __restrict__ p, int row_v, int n_rows, u
     for (; i < row_v; i += 32) acc ^= bw_fold(__ldg(r + i));
     if (acc == 0x9e3779b9u) out[0] = acc;
 }
+// SM clock: every thread spins `cycles` SM clocks; cycles / event time = the clock the GPU actually ran at
+__global__ void clk_spin_kernel(long long cycles, unsigned* out) {
+    const long long t0 = clock64();
+    while (clock64() - t0 < cycles) {}
+    if (cycles < 0) out[0] = 1;
+}
 }  // namespace
+#if !defined(__HIPCC__)
+void iq_decode_occupancy_report();   // iq_kernels.cu
+#endif
 void gpu_read_bw_probe() {
     const char* e = std::getenv("STRATA_BW_PROBE");
     if (e == nullptr || e[0] != '1') return;
@@ -2709,6 +2732,59 @@ void gpu_read_bw_probe() {
     cudaEventCreate(&b);
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    {
+        int khz = 0;
+        cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0);
+        const auto spin = [&](long long cycles) {
+            cudaEventRecord(a);
+            clk_spin_kernel<<<(unsigned) (sms * 2), 256>>>(cycles, out);
+            cudaEventRecord(b);
+            cudaEventSynchronize(b);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, a, b);
+            return cycles / (ms * 1e3);   // MHz
+        };
+        std::string seq;
+        for (int i = 0; i < 40; ++i) {   // 40 x 2M cycles back to back (~60 ms at 1.3 GHz): the clock under full load
+            char t[16];
+            std::snprintf(t, sizeof t, " %.0f", spin(2000000));
+            seq += t;
+        }
+        std::fprintf(stderr, "strata bw-probe: SM clock (attribute max %d MHz), 40 busy spins of 2M cycles, MHz:%s\n",
+                     khz / 1000, seq.c_str());
+        seq.clear();
+        for (int i = 0; i < 8; ++i) {   // short bursts after host-side idle gaps, as between decode windows
+            const auto t0 = std::chrono::steady_clock::now();
+            while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(20)) {}
+            char t[16];
+            std::snprintf(t, sizeof t, " %.0f", spin(200000));
+            seq += t;
+        }
+        std::fprintf(stderr, "strata bw-probe: SM clock, 200K-cycle spins after 20 ms idle, MHz:%s\n", seq.c_str());
+    }
+#if !defined(__HIPCC__)
+    {   // registers and occupancy of the decode GEMVs (Q6_K IL at the IL-rows string's 1 and 2 rows a warp)
+        const auto rep = [](const char* name, const void* f) {
+            cudaFuncAttributes fa{};
+            int blocks = 0;
+            if (cudaFuncGetAttributes(&fa, f) != cudaSuccess ||
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, f, 4 * WARP, 0) != cudaSuccess) {
+                cudaGetLastError();
+                return;
+            }
+            std::fprintf(stderr, "strata bw-probe: %s: %d registers, %zu B local, %d blocks of 128 a SM\n", name,
+                         fa.numRegs, fa.localSizeBytes, blocks);
+        };
+        rep("il Q6_K nc2 r1", (const void*) native_mmvq_il_kernel<IlQ6K, 2, 1>);
+        rep("il Q6_K nc3 r1", (const void*) native_mmvq_il_kernel<IlQ6K, 3, 1>);
+        rep("il Q6_K nc4 r1", (const void*) native_mmvq_il_kernel<IlQ6K, 4, 1>);
+        rep("il Q6_K nc2 r2", (const void*) native_mmvq_il_kernel<IlQ6K, 2, 2>);
+        rep("il Q6_K nc3 r2", (const void*) native_mmvq_il_kernel<IlQ6K, 3, 2>);
+        rep("il Q6_K nc4 r2", (const void*) native_mmvq_il_kernel<IlQ6K, 4, 2>);
+        rep("il IQ4_XS nc3 r2", (const void*) native_mmvq_il_kernel<IlIQ4XS, 3, 2>);
+        iq_decode_occupancy_report();
+    }
+#endif
     const auto run = [&](int u, int blocks_per_sm) {
         float best = 1e30f;
         for (int rep = 0; rep < 6; ++rep) {

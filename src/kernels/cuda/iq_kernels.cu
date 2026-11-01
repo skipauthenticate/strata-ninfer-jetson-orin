@@ -799,6 +799,13 @@ template<> struct Split<18> {   // IQ3_XXS
     }
 };
 template<> inline constexpr bool kSplit<21> = true;
+// Grid bytes x with sign bits n (bit k for byte k): byte k -> -x if bit k is set, else x; the bytes
+// __vsub4(x ^ s, s) gives for s = __vcmpne4(bit k at byte k, 0), without the two emulated SIMD ops. The multiply puts
+// bit k at bit 8k (copies at 0/7/14/21 never overlap); ~x + 1 stays inside its byte because IQ3_S grid bytes are odd.
+__device__ __forceinline__ int iq3s_sign4(int x, unsigned n) {
+    const unsigned t = (n * 0x00204081u) & 0x01010101u;
+    return int((unsigned(x) ^ (t * 0xFFu)) + t);
+}
 template<> struct Split<21> {   // IQ3_S
     struct W { int g[8]; int ls; float dw; };
     template<bool STAGE_GRID = false>
@@ -814,10 +821,8 @@ template<> struct Split<21> {   // IQ3_S
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int2 grid_pos = make_int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
                                             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
-            const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
-            r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
-            r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+            r.g[l0 + 0] = iq3s_sign4(grid_pos.x, signs_packed_8[l0 / 2] & 0x0Fu);
+            r.g[l0 + 1] = iq3s_sign4(grid_pos.y, unsigned(signs_packed_8[l0 / 2]) >> 4);
         }
         r.ls = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
         r.dw = __half2float(bq3->d);
@@ -2696,6 +2701,26 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
+
+#if !defined(__HIPCC__)
+// ar diagnostic (STRATA_BW_PROBE=1, called by gpu_read_bw_probe): registers and resident blocks a SM of the decode
+// expert kernels (IQ3_S gate/up, IQ4_NL down)
+void iq_decode_occupancy_report() {
+    const auto rep = [](const char* name, const void* f) {
+        cudaFuncAttributes a{};
+        int blocks = 0;
+        if (cudaFuncGetAttributes(&a, f) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, f, 256, 0) != cudaSuccess) {
+            cudaGetLastError();
+            return;
+        }
+        std::fprintf(stderr, "strata bw-probe: %s: %d registers, %zu B static smem, %zu B local, %d blocks of 256 a SM\n",
+                     name, a.numRegs, a.sharedSizeBytes, a.localSizeBytes, blocks);
+    };
+    rep("native_gu_multi_kernel<IQ3_S, sub16>", (const void*) native_gu_multi_kernel<21, false, true>);
+    rep("native_down_multi_kernel<IQ4_NL, sub>", (const void*) native_down_multi_kernel<20, true>);
+}
+#endif
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
