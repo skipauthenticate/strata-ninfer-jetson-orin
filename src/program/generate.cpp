@@ -11898,6 +11898,24 @@ int main(int argc, char** argv) {
                                      (unsigned long long) (ic.pf_dropped - ic_prev.pf_dropped),
                                      (double) (ic.crit_us - ic_prev.crit_us) / 1e3,
                                      (unsigned long long) (ic.crit_n - ic_prev.crit_n));
+                    if (drive.d.lookahead != nullptr) {   // the router look-ahead this request (what feeds the read-ahead)
+                        static int64_t la_p0 = 0, la_s0 = 0;
+                        static double la_b0 = 0.0;
+                        const int64_t la_p = drive.d.lookahead->predicted(), la_s = drive.d.lookahead->skipped();
+                        const double la_b = drive.d.lookahead->busy_ms();
+                        std::fprintf(stderr, "; look-ahead: %lld predicted, %lld layers skipped (busy), %.1f ms on its thread",
+                                     (long long) (la_p - la_p0), (long long) (la_s - la_s0), la_b - la_b0);
+                        la_p0 = la_p; la_s0 = la_s; la_b0 = la_b;
+                    }
+                    if (!drive.d.miss_req.empty()) {   // STRATA_MISS_REPLAY: this request's verify-window CPU misses
+                        static int64_t mr_n0 = 0, mr_e0 = 0, mr_s0 = 0, mr_r0 = 0;
+                        std::fprintf(stderr, "; miss replay: %lld window misses, %lld had missed in an earlier request, %lld earlier "
+                                             "in this one, %lld pairs replayed (%zu known)",
+                                     (long long) (drive.d.miss_n - mr_n0), (long long) (drive.d.miss_earlier - mr_e0),
+                                     (long long) (drive.d.miss_same - mr_s0), (long long) (drive.d.miss_replayed - mr_r0),
+                                     drive.d.miss_list.size());
+                        mr_n0 = drive.d.miss_n; mr_e0 = drive.d.miss_earlier; mr_s0 = drive.d.miss_same; mr_r0 = drive.d.miss_replayed;
+                    }
                     std::fprintf(stderr, "\n");
                     if (io_now.valid) io_prev = io_now;
                     ic_prev = ic;

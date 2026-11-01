@@ -28,6 +28,7 @@
 #include <deque>
 #include <fstream>
 #include <filesystem>
+#include <functional>
 #include <sstream>
 #include <limits>
 #include <map>
@@ -36,6 +37,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -1888,6 +1892,43 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
 #endif
 }
 
+#if defined(__aarch64__)
+// STRATA_LA_NEON=1: the look-ahead's router dot on NEON (ARM has no AVX path; the scalar loop takes ~2 ms a token-layer,
+// so the predictor skipped most layers and its reads landed after the layer).  A prediction only: the experts computed
+// and their results never depend on it.  cols % 8 == 0 (start() checks n_embd).
+template <int NT>
+static void la_dot_neon(const uint16_t* w, int rows, int cols, const float* x, float* out) {
+    for (int r = 0; r < rows; ++r) {
+        const uint16_t* wr = w + (size_t) r * (size_t) cols;
+        float32x4_t a0[NT], a1[NT];
+        for (int t = 0; t < NT; ++t) { a0[t] = vdupq_n_f32(0.f); a1[t] = vdupq_n_f32(0.f); }
+        for (int c = 0; c < cols; c += 8) {
+            const uint16x8_t b = vld1q_u16(wr + c);
+            const float32x4_t w0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b), 16));
+            const float32x4_t w1 = vreinterpretq_f32_u32(vshll_high_n_u16(b, 16));
+            for (int t = 0; t < NT; ++t) {
+                const float* xt = x + (size_t) t * (size_t) cols + c;
+                a0[t] = vfmaq_f32(a0[t], w0, vld1q_f32(xt));
+                a1[t] = vfmaq_f32(a1[t], w1, vld1q_f32(xt + 4));
+            }
+        }
+        for (int t = 0; t < NT; ++t) out[(size_t) t * (size_t) rows + r] = vaddvq_f32(vaddq_f32(a0[t], a1[t]));
+    }
+}
+static void la_bf16_rows_dot_neon(const uint16_t* w, int rows, int cols, const float* x, int nt, float* out) {
+    switch (nt) {
+        case 1: la_dot_neon<1>(w, rows, cols, x, out); break;
+        case 2: la_dot_neon<2>(w, rows, cols, x, out); break;
+        case 3: la_dot_neon<3>(w, rows, cols, x, out); break;
+        case 4: la_dot_neon<4>(w, rows, cols, x, out); break;
+        case 5: la_dot_neon<5>(w, rows, cols, x, out); break;
+        case 6: la_dot_neon<6>(w, rows, cols, x, out); break;
+        case 7: la_dot_neon<7>(w, rows, cols, x, out); break;
+        default: la_dot_neon<8>(w, rows, cols, x, out); break;   // submit() caps n_tok at 8
+    }
+}
+#endif
+
 RouterLookahead::~RouterLookahead() {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1966,6 +2007,13 @@ void RouterLookahead::run() {
         // one (kq_avx1.cpp) or, without AVX, the same sums in plain C++.  From the Strata_Dirigo fork (rwkeyes): an
         // AVX-only Xeon E5-2687W died here (vpmovzxwd) on its first request.  An estimate only (which experts to
         // prefetch); the order of the additions differs between the three, the output does not depend on it.
+#if defined(__aarch64__)
+        static const bool la_neon = [] { const char* v = std::getenv("STRATA_LA_NEON"); return v != nullptr && std::atoi(v) != 0; }();
+        if (la_neon) {
+            la_bf16_rows_dot_neon(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_, x_.data(), (int) nt,
+                                  logits.data());
+        } else
+#endif
         if (strata::kernels::cpu::cpu_avx2_ok()) {
             strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
                                                       x_.data(), (int) nt, logits.data());
@@ -3282,6 +3330,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (d.lookahead != nullptr) d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
+    static const bool miss_replay = [] { const char* v = std::getenv("STRATA_MISS_REPLAY"); return v != nullptr && std::atoi(v) != 0; }();
+    if (miss_replay && d.src != nullptr) {
+        // shortcut: a new request = positions drop by more than a window (16 > kVerifyMaxT, and a split window's
+        // second group starts a few rows later); a request whose prompt outgrows the last one is not seen as new
+        if (position0 + 16 < d.miss_last_pos && !d.miss_list.empty()) {   // a new request (positions restart): replay
+            ++d.miss_req_now;
+            std::vector<int64_t> order(d.miss_list);
+            // the I/O workers take the newest first: queue the deepest layers first so layer 0's come back first
+            std::sort(order.begin(), order.end(), std::greater<int64_t>());
+            for (const int64_t key : order) {
+                const int64_t e = key % d.n_expert;
+                d.src->warm(key / d.n_expert, &e, 1);
+            }
+            d.miss_replayed += (int64_t) order.size();
+        }
+        d.miss_last_pos = position0;
+    }
     if (k < 1 || n_tok * k > kMaxWindowEntries) {
         d.failed = true;
         d.fail = "a verify window routes more entries than the expert pool's window tables hold";
@@ -3487,6 +3552,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
+        if (miss_replay && d.layers >= 0 && d.layers < (int64_t) lay.n_layers) {
+            if (d.miss_req.empty()) d.miss_req.assign((size_t) (lay.n_layers * d.n_expert), 0);
+            for (const int64_t e : miss) {
+                const int64_t key = d.layers * d.n_expert + e;
+                int16_t& r = d.miss_req[(size_t) key];
+                ++d.miss_n;
+                if (r == 0) {
+                    r = (int16_t) (d.miss_req_now + 1);
+                    d.miss_list.push_back(key);
+                } else if (r - 1 < d.miss_req_now) {
+                    ++d.miss_earlier;
+                } else {
+                    ++d.miss_same;
+                }
+            }
+        }
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
     int njobs = 0;

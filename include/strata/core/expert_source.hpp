@@ -302,6 +302,15 @@ struct ExpertDispatch {
     int64_t experts = 0;
     int64_t missing = 0;
 
+    /// STRATA_MISS_REPLAY=1 (ar, I/O only): the verify windows' CPU-miss (layer, expert) pairs are remembered, and
+    /// read ahead again (file tier -> page cache) when a new request's first window arrives: its prompt streamed the
+    /// whole file tier through the page cache in between.  Counts how often a miss had missed in an earlier request.
+    std::vector<int16_t> miss_req;     ///< layer * n_expert + expert: 0 = never missed, else 1 + the request it first missed in
+    std::vector<int64_t> miss_list;    ///< the pairs in first-miss order
+    int16_t miss_req_now = 0;
+    int64_t miss_last_pos = -1;
+    int64_t miss_n = 0, miss_earlier = 0, miss_same = 0, miss_replayed = 0;
+
     // Optional server experiment: stage routed-expert usage per verifier row so
     // only rows whose outputs are published can affect adaptive residency.
     // Empty preserves the historical all-window accounting path.
