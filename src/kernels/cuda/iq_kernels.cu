@@ -1244,7 +1244,7 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 constexpr int GRP_NC = 4;
 
 template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, bool SUB16 = true>
-__global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
+__global__ void __launch_bounds__(256, 5) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
                                                               const int32_t* __restrict__ ent_tok,
