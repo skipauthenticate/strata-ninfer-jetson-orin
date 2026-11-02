@@ -750,7 +750,9 @@ const int g_hc_down_wpb = [] {
     return w >= WARPS && w * 32 <= BAL_MAX_THREADS ? w : 0;
 }();
 
-template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+// NOLOAD (ar diagnostic, the BW probe only): synthesized weights instead of the global loads, the same FMAs and
+// shared loads, to time the compute side alone
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, bool NOLOAD = false>
 __global__ void __launch_bounds__(BAL_MAX_THREADS) gr_down_bal_kernel(GrMulti m) {
     extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
     const int t = threadIdx.x, lane = t & 31, nt = blockDim.x;
@@ -775,7 +777,10 @@ __global__ void __launch_bounds__(BAL_MAX_THREADS) gr_down_bal_kernel(GrMulti m)
     uint4 wv[HQ], wnext[HQ];
     if (active) {
 #pragma unroll
-        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+        for (int q = 0; q < HQ; ++q) {
+            if constexpr (NOLOAD) wv[q] = make_uint4(lane + q, lane * 3u + q, lane * 5u + q, lane * 7u + q);
+            else wv[q] = __ldg(w4 + lane + 32 * q);
+        }
     }
     stage(0, hbuf);
     cp_async_commit();
@@ -785,7 +790,14 @@ __global__ void __launch_bounds__(BAL_MAX_THREADS) gr_down_bal_kernel(GrMulti m)
     for (int h = 0; h < N_HTILES; ++h) {
         if (active && h + 1 < N_HTILES) {
 #pragma unroll
-            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+            for (int q = 0; q < HQ; ++q) {
+                if constexpr (NOLOAD) {
+                    const unsigned s = (unsigned) (h + 1) * 131u + (unsigned) lane;
+                    wnext[q] = make_uint4(s + q, s * 3u + q, s * 5u + q, s * 7u + q);
+                } else {
+                    wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+                }
+            }
         }
         if (h + 1 < N_HTILES) cp_async_wait1();
         else cp_async_wait0();
@@ -826,6 +838,132 @@ __global__ void __launch_bounds__(BAL_MAX_THREADS) gr_down_bal_kernel(GrMulti m)
             const float x = s[k] / (float) HC;
             m.a[k].lo[row] = x / (1.0f + __expf(-x));
         }
+    }
+}
+
+// ar diagnostic (the BW probe only, never launched by the engine): r2-e034's rows-per-warp down read generalized to
+// R rows a warp, rpb rows a block; each row's lanes, tiles, dot8u order and xor tree are gr_down_bal_kernel's
+template <int T, int R, int DEPTH = 1, bool NOLOAD = false>
+__global__ void __launch_bounds__((21 + R - 1) / R * 32) gr_down_rr_kernel(GrMulti m, int rpb) {
+    extern __shared__ __align__(16) float4 hbuf[];
+    const int t = threadIdx.x, lane = t & 31, nt = blockDim.x;
+    int rows[R];
+    bool inj[R], act[R];
+    const uint4* w4[R];
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        const int lr = R * (t >> 5) + p;
+        const int gw = blockIdx.x * rpb + lr;
+        inj[p] = gw >= LR;
+        rows[p] = inj[p] ? gw - LR : gw;
+        act[p] = lr < rpb && (!inj[p] || (rows[p] < HC && m.a[0].w_inject != nullptr));
+        w4[p] = reinterpret_cast<const uint4*>((inj[p] ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (act[p] ? rows[p] : 0) * D);
+    }
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    const auto stage = [&](int h, float4* buf) {
+        for (int i = t; i < T * (H_TILE / 4); i += nt) {
+            const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);
+            const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
+            cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
+        }
+    };
+    float acc[R][T];
+#pragma unroll
+    for (int p = 0; p < R; ++p)
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[p][k] = 0.0f;
+    // the 8 tiles fully unrolled: tile h's weights are their own registers, loaded DEPTH tiles ahead (no moves that
+    // wait on a load in flight)
+    uint4 wt[N_HTILES][R][HQ];
+    const auto load = [&](int h) {
+#pragma unroll
+        for (int p = 0; p < R; ++p)
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                if constexpr (NOLOAD) {
+                    const unsigned s = (unsigned) h * 131u + (unsigned) lane + (unsigned) p;
+                    wt[h][p][q] = make_uint4(s + q, s * 3u + q, s * 5u + q, s * 7u + q);
+                } else {
+                    wt[h][p][q] = act[p] ? __ldg(w4[p] + h * (H_TILE / 8) + lane + 32 * q) : make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+    };
+#pragma unroll
+    for (int h = 0; h < DEPTH; ++h) load(h);
+    stage(0, hbuf);
+    cp_async_commit();
+    stage(1, hbuf + buf_f4);
+    cp_async_commit();
+#pragma unroll
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (h + DEPTH < N_HTILES) load(h + DEPTH);
+        if (h + 1 < N_HTILES) cp_async_wait1();
+        else cp_async_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (act[0]) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+                Bf16x8 w[R];
+#pragma unroll
+                for (int p = 0; p < R; ++p) w[p] = unpack8(wt[h][p][q]);
+#pragma unroll
+                for (int k = 0; k < T; ++k) {
+                    const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                    const float4 x0 = pk[j], x1 = pk[H_TILE / 8 + j];
+#pragma unroll
+                    for (int p = 0; p < R; ++p) acc[p][k] += dot8u(w[p], x0, x1);
+                }
+            }
+        }
+        __syncthreads();
+        if (h + 2 < N_HTILES) stage(h + 2, hbuf + (h & 1) * buf_f4);
+        cp_async_commit();
+    }
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        if (!act[p]) continue;
+        float s[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) s[k] = warp_sum(acc[p][k]);
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            if (lane != k) continue;
+            if (inj[p]) {
+                m.a[k].inject_out[rows[p]] = s[k];
+            } else {
+                const float x = s[k] / (float) HC;
+                m.a[k].lo[rows[p]] = x / (1.0f + __expf(-x));
+            }
+        }
+    }
+}
+
+// ar opt-in STRATA_HC_DOWN_RR=1 (with STRATA_HC_DOWN_WPB): launches of 1..6 tokens take gr_down_rr_kernel<T, 2, 2>
+// (2 rows a warp, 11 rows a block = 30 blocks of 6 warps, weights 2 tiles ahead); r2-p005 alone: 43.3 / 46.4 / 48.9
+// / 52.3 us at T1-T4 vs 44.9 / 47.1 / 52.6 / 61.0.  Each row's lanes, tiles, dot8u order and xor tree are
+// gr_down_bal_kernel's: bitwise the same lo / inject_out.
+const bool g_hc_down_rr = [] { const char* v = std::getenv("STRATA_HC_DOWN_RR"); return v && v[0] == '1'; }();
+// gr_down_rr_kernel's launcher, also used by the BW probe (attr: set its smem attributes instead of launching)
+template <int R, int DEPTH, bool NOLOAD>
+void ar_rr_launch(int T, int rpb, size_t sm, cudaStream_t st, const GrMulti& c, bool attr) {
+    const unsigned g = (unsigned) ((LR + HC + rpb - 1) / rpb), n = (unsigned) ((rpb + R - 1) / R * 32);
+    const auto go = [&](auto f) {
+        if (attr) {
+            cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sm);
+            cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        } else {
+            f<<<g, n, sm, st>>>(c, rpb);
+        }
+    };
+    switch (T) {
+        case 1: go(gr_down_rr_kernel<1, R, DEPTH, NOLOAD>); break;
+        case 2: go(gr_down_rr_kernel<2, R, DEPTH, NOLOAD>); break;
+        case 3: go(gr_down_rr_kernel<3, R, DEPTH, NOLOAD>); break;
+        case 4: go(gr_down_rr_kernel<4, R, DEPTH, NOLOAD>); break;
+        case 5: go(gr_down_rr_kernel<5, R, DEPTH, NOLOAD>); break;
+        default: go(gr_down_rr_kernel<6, R, DEPTH, NOLOAD>); break;
     }
 }
 
@@ -914,6 +1052,8 @@ int down_chunk(bool staged, int* tile_out) {
         set_staged_attr(gr_down_bal_kernel<5, true>, 5);
         set_staged_attr(gr_down_bal_kernel<6, true>, 6);
         set_staged_attr(gr_down_bal_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
+        if (g_hc_down_rr)
+            for (int k = 1; k <= 6; ++k) ar_rr_launch<2, 2, false>(k, 11, (size_t) k * 2 * H_TILE * sizeof(float), nullptr, GrMulti{}, true);
         cudaGetLastError();      // drop any error the attempt left behind
         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
@@ -1006,7 +1146,8 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         const bool max4 = ct <= 4 && gr_down_max4();
         if (staged && g_hc_down_wpb > 0) {   // ar opt-in STRATA_HC_DOWN_WPB: the same rows, W warps a block
             const unsigned gb = (unsigned) ((LR + HC + g_hc_down_wpb - 1) / g_hc_down_wpb), nt = (unsigned) g_hc_down_wpb * 32;
-            if (exact_t && ct == 1) gr_down_bal_kernel<1, true><<<gb, nt, smem, st>>>(c);
+            if (g_hc_down_rr && exact_t && ct <= 6) ar_rr_launch<2, 2, false>(ct, 11, smem, st, c, false);
+            else if (exact_t && ct == 1) gr_down_bal_kernel<1, true><<<gb, nt, smem, st>>>(c);
             else if (exact_t && ct == 2) gr_down_bal_kernel<2, true><<<gb, nt, smem, st>>>(c);
             else if (exact_t && ct == 3) gr_down_bal_kernel<3, true><<<gb, nt, smem, st>>>(c);
             else if (exact_t && ct == 4) gr_down_bal_kernel<4, true><<<gb, nt, smem, st>>>(c);
@@ -2219,6 +2360,118 @@ void gr_occupancy_report() {
     rep("gr_up_fast_kernel", (const void*) gr_up_fast_kernel, 0);
     rep("gr_up_fast_lr_kernel", (const void*) gr_up_fast_lr_kernel, 0);
     rep("gr_up_fast_lr_pf_kernel", (const void*) gr_up_fast_lr_pf_kernel, 0);
+    // The down read (STRATA_HC_DOWN_WPB kernel) and the fast up read timed alone at T 1-6: L launches on fresh
+    // weights (L2 never holds them) in one graph, best of 5 replays; the down read also as NOLOAD (no weight loads:
+    // its FMAs, shared loads and barriers alone).  Does a read's growth with T come from the kernel or its context?
+    if (g_hc_down_wpb > 0 && g_gr_up_lr) {
+        constexpr int L = 16;
+        const size_t dsz = (size_t) (LR + HC) * D, usz = (size_t) D * LR;
+        const size_t per_k = (size_t) LR + HC + D + D + HC + N;   // lo, inject_out, R, w_norm, rs, mixed
+        const size_t nf = (size_t) kFusedGrMaxT * D + (size_t) kFusedGrMaxT * per_k;
+        uint16_t *wd = nullptr, *wu = nullptr;
+        float* fb = nullptr;
+        cudaStream_t st = nullptr;
+        cudaEvent_t e0 = nullptr, e1 = nullptr;
+        if (cudaMalloc(&wd, L * dsz * 2) != cudaSuccess || cudaMalloc(&wu, L * usz * 2) != cudaSuccess ||
+            cudaMalloc(&fb, nf * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "strata bw-probe: hc timing: allocation failed\n");
+        } else {
+            cudaMemset(wd, 0x3c, L * dsz * 2);
+            cudaMemset(wu, 0x3c, L * usz * 2);
+            cudaMemset(fb, 0x3c, nf * sizeof(float));
+            cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+            GrMulti m{};
+            m.xn = fb;
+            float* p = fb + (size_t) kFusedGrMaxT * D;
+            for (int k = 0; k < kFusedGrMaxT; ++k) {
+                FusedGrArgs& a = m.a[k];
+                a.lo = p; p += LR;
+                a.inject_out = p; p += HC;
+                a.R = p; a.R_out = p; p += D;
+                a.w_norm = p; p += D;
+                a.rs = p; p += HC;
+                a.mixed = p; p += N;
+            }
+            const unsigned nt = (unsigned) g_hc_down_wpb * 32, gb = (unsigned) ((LR + HC + g_hc_down_wpb - 1) / g_hc_down_wpb);
+            const auto down = [&](bool noload, int T, const GrMulti& c) {
+                const size_t sm = (size_t) T * per_tok;
+#define AR_DOWN(TT) do { auto f = noload ? gr_down_bal_kernel<TT, true, true> : gr_down_bal_kernel<TT, true, false>; \
+                    f<<<gb, nt, sm, st>>>(c); } while (0)
+                switch (T) { case 1: AR_DOWN(1); break; case 2: AR_DOWN(2); break; case 3: AR_DOWN(3); break;
+                             case 4: AR_DOWN(4); break; case 5: AR_DOWN(5); break; default: AR_DOWN(6); break; }
+#undef AR_DOWN
+            };
+            const auto attr = [&](auto f, int T) {
+                cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) (T * per_tok));
+                cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            };
+            attr(gr_down_bal_kernel<1, true, true>, 1); attr(gr_down_bal_kernel<2, true, true>, 2);
+            attr(gr_down_bal_kernel<3, true, true>, 3); attr(gr_down_bal_kernel<4, true, true>, 4);
+            attr(gr_down_bal_kernel<5, true, true>, 5); attr(gr_down_bal_kernel<6, true, true>, 6);
+            // what 3: R2 rows a warp, 11 rows a block, weights 1 tile ahead; 4: the same 2 tiles ahead; 5: R1, 11 rows
+            // a block, 2 ahead; 6: R2, 21 rows a block, 2 ahead; 7: 3 without weight loads (NOLOAD)
+            const auto rr = [&](int what, int T, const GrMulti& c, bool set) {
+                const size_t sm = (size_t) T * per_tok;
+                if (what == 3) ar_rr_launch<2, 1, false>(T, 11, sm, st, c, set);
+                else if (what == 4) ar_rr_launch<2, 2, false>(T, 11, sm, st, c, set);
+                else if (what == 5) ar_rr_launch<1, 2, false>(T, 11, sm, st, c, set);
+                else if (what == 6) ar_rr_launch<2, 2, false>(T, 21, sm, st, c, set);
+                else ar_rr_launch<2, 1, true>(T, 11, sm, st, c, set);
+            };
+            for (int w = 3; w <= 7; ++w)
+                for (int T = 1; T <= 6; ++T) rr(w, T, m, true);
+            cudaGetLastError();
+            const auto timed = [&](int what, int T) -> float {   // us a launch: 0 down, 1 down NOLOAD, 2 up
+                cudaGraph_t g = nullptr;
+                cudaGraphExec_t ge = nullptr;
+                cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+                for (int l = 0; l < L; ++l) {
+                    GrMulti c = m;
+                    c.T = T;
+                    c.a[0].w_down = wd + l * dsz;
+                    c.a[0].w_inject = wd + l * dsz + (size_t) LR * D;
+                    c.a[0].w_up = wu + l * usz;
+                    if (what == 2) gr_up_fast_lr_pf_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(c, g_hc_up_pf);
+                    else if (what >= 3) rr(what, T, c, false);
+                    else down(what == 1, T, c);
+                }
+                if (cudaStreamEndCapture(st, &g) != cudaSuccess || cudaGraphInstantiate(&ge, g, 0) != cudaSuccess) {
+                    cudaGetLastError();
+                    return -1.0f;
+                }
+                float best = 1e30f;
+                for (int rep = 0; rep < 6; ++rep) {
+                    cudaEventRecord(e0, st);
+                    cudaGraphLaunch(ge, st);
+                    cudaEventRecord(e1, st);
+                    cudaEventSynchronize(e1);
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    if (rep > 0 && ms < best) best = ms;
+                }
+                cudaGraphExecDestroy(ge);
+                cudaGraphDestroy(g);
+                if (cudaGetLastError() != cudaSuccess) return -1.0f;
+                return best * 1e3f / L;
+            };
+            for (int T = 1; T <= 6; ++T) {
+                const float d = timed(0, T), dn = timed(1, T), u = timed(2, T);
+                std::fprintf(stderr, "strata bw-probe: hc alone T%d: down %.1f us (%.0f GB/s), down NOLOAD %.1f us, up %.1f us "
+                                     "(%.0f GB/s); down R2/11 D1 %.1f, R2/11 D2 %.1f, R1/11 D2 %.1f, R2/21 D2 %.1f, "
+                                     "R2/11 D1 NOLOAD %.1f us\n", T, d, dsz * 2 / (d * 1e3), dn, u, usz * 2 / (u * 1e3),
+                             timed(3, T), timed(4, T), timed(5, T), timed(6, T), timed(7, T));
+            }
+            cudaEventDestroy(e0);
+            cudaEventDestroy(e1);
+            cudaStreamDestroy(st);
+        }
+        cudaFree(wd);
+        cudaFree(wu);
+        cudaFree(fb);
+    }
 #endif
 }
 #endif
