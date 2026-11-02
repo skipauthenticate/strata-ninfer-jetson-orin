@@ -43,6 +43,8 @@ All new behavior is opt-in; with none of these switches set, the engine is uncha
   kernels (`STRATA_IL56`).
 
 The best settings are `overrides/r2-e043-iq4xs-rr.json` on top of `base-overrides.json` (round 1's fast build).
+To install them, follow [round 1's fast-build guide](../2026-11-01-orin-decode-autoresearch/fast-build/README.md),
+which now includes round 2's draft head and switches (34.89 tok/s through the start script, needles 3/3).
 
 ## Why it stops near 35 tok/s
 
