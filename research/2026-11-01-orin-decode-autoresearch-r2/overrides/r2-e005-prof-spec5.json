@@ -1,0 +1,1 @@
+{"args": {"--spec": "5"}, "env": {"STRATA_IL56": "1", "STRATA_DECODE_TIMING": "1", "STRATA_SPEC_DEPTH": "1", "STRATA_VERIFY_PROFILE": "1", "STRATA_BW_PROBE": "1"}}

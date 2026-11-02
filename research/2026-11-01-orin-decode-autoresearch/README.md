@@ -5,6 +5,9 @@ Jetson AGX Orin 64 GB (JetPack 7, CUDA 13.2) for about eight hours. Each experim
 measured decode speed, and kept the change only if it helped and did not change the model's math. The engine changes
 are the commits on this branch; this folder holds the rules, the harness and every measurement.
 
+A second round the same afternoon took the best settings to 35.18 tok/s: see
+[../2026-11-01-orin-decode-autoresearch-r2](../2026-11-01-orin-decode-autoresearch-r2/README.md).
+
 ## Result
 
 Qwen3.8-Flash-Next IQ3_S with a 262,144-token context and int8 KV. Decode is the engine-reported rate, the median of

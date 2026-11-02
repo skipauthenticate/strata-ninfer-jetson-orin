@@ -1,0 +1,1 @@
+{"args": {}, "env": {"STRATA_SPEC_CUM": "0,0.40,0.47", "STRATA_IO_PREFETCH": "1", "STRATA_MTP_EXPERTS": "/home/<user>/strata/Strata-data/mtp-hp/mtp-q4_0.gguf", "STRATA_LA_NEON": "1"}}

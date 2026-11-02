@@ -1,0 +1,1 @@
+{"args": {"--spec": "5"}, "env": {"STRATA_IL56": "1", "STRATA_MMVQ_IL_ROWS": "14:2:0,1,1,1,2;14:3:0,1,1,1,2;14:4:0,1,1,1,2;14:5:0,2,2,2,2", "STRATA_SPEC_CUM": "0,0.40,0.47,0.50", "STRATA_DECODE_TIMING": "1", "STRATA_SPEC_DEPTH": "1", "STRATA_MTP_EXPERTS": "/home/<user>/strata/Strata-data/mtp-hp/mtp-q4_0.gguf"}}
