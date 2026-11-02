@@ -43,7 +43,13 @@
 #include <exception>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <thread>
 #include <vector>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include "strata/platform/cpu_relax.hpp"
 
 #ifdef STRATA_NATIVE_EXPERTS
@@ -276,8 +282,15 @@ bool MtpDrafter::load_gguf_experts(const std::string& path, const ModelGeometry&
             err = "mtp: " + path + ": no native expert kernels for " + gu->type_name() + " / " + dn->type_name();
             return false;
         }
-        const auto L = strata::kernels::native_expert_layout((int) gu->type, (int) dn->type, g.n_embd, g.n_ff);
-        const uint64_t gu_b = L.down_off, d_b = L.bytes - L.down_off;
+        // ar opt-in STRATA_MTP_EXPERTS_AS=iq4_xs: the GGUF's experts (its Q8_0, say) requantized at load to gate/up
+        // IQ4_XS + down IQ4_NL (4.25 / 4.5 bits a weight; Q2_0 is the base drafter's), the main model's expert kernel
+        // family (Split + LDS gate/up, IQ4_NL down) instead of Q4_0's per-entry path. IQ4_XS needs rows of 256, so the
+        // 640-wide down rows take IQ4_NL (native_expert_grouped has no IQ4_NL gate/up).
+        static const char* as_env = std::getenv("STRATA_MTP_EXPERTS_AS");
+        const bool req = as_env != nullptr && std::string(as_env) == "iq4_xs";
+        const auto Ls = strata::kernels::native_expert_layout((int) gu->type, (int) dn->type, g.n_embd, g.n_ff);
+        const auto L = req ? strata::kernels::native_expert_layout(23, 20, g.n_embd, g.n_ff) : Ls;
+        const uint64_t gu_b = Ls.down_off, d_b = Ls.bytes - Ls.down_off;
         for (const strata::TensorInfo* t : {gu, dn})
             if (strata::tensor_payload_bytes(*t) != E * (t == gu ? gu_b : d_b) ||
                 f.data_start() + t->offset + strata::tensor_payload_bytes(*t) > f.file_size()) {
@@ -286,19 +299,59 @@ bool MtpDrafter::load_gguf_experts(const std::string& path, const ModelGeometry&
             }
         if (cudaMalloc((void**) &experts_, E * L.bytes) != cudaSuccess) { err = "mtp: the GGUF experts do not fit in VRAM"; return false; }
         strata::platform::integration_trace::event("mtp-base-weights", "allocate", this, experts_, E * L.bytes, device_);
+        if (req) {
+#ifdef STRATA_NATIVE_EXPERTS
+            const auto* tg = ggml_get_type_traits((ggml_type) gu->type);
+            const auto* td = ggml_get_type_traits((ggml_type) dn->type);
+            if (tg == nullptr || tg->to_float == nullptr || td == nullptr || td->to_float == nullptr) {
+                err = "mtp: STRATA_MTP_EXPERTS_AS: cannot dequantize " + std::string(gu->type_name());
+                return false;
+            }
+            std::atomic<uint64_t> next{0};
+            std::atomic<bool> bad{false};
+            std::vector<std::thread> pool;
+            const unsigned nt = std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
+            for (unsigned w = 0; w < nt; ++w)
+                pool.emplace_back([&] {   // one expert at a time: a 2.6 MB buffer a thread, not the 1.4 GB whole
+                    cudaSetDevice(device_);
+                    std::vector<uint8_t> buf((size_t) L.bytes);
+                    std::vector<float> row((size_t) H);
+                    for (uint64_t e = next.fetch_add(1); e < E && !bad.load(); e = next.fetch_add(1)) {
+                        const uint8_t* sg = f.tensor_data(*gu) + e * gu_b;
+                        const uint8_t* sd = f.tensor_data(*dn) + e * d_b;
+                        for (uint64_t r = 0; r < 2 * FF; ++r) {
+                            tg->to_float(sg + r * Ls.gu_row, row.data(), (int64_t) H);
+                            ggml_quantize_chunk(GGML_TYPE_IQ4_XS, row.data(), buf.data() + r * L.gu_row, 0, 1, (int64_t) H, nullptr);
+                        }
+                        for (uint64_t r = 0; r < H; ++r) {
+                            td->to_float(sd + r * Ls.d_row, row.data(), (int64_t) FF);
+                            ggml_quantize_chunk(GGML_TYPE_IQ4_NL, row.data(), buf.data() + L.down_off + r * L.d_row, 0, 1,
+                                                (int64_t) FF, nullptr);
+                        }
+                        if (cudaMemcpy(experts_ + e * L.bytes, buf.data(), L.bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+                            bad = true;
+                    }
+                });
+            for (auto& th : pool) th.join();
+            if (bad) { err = "mtp: copying the requantized GGUF experts"; return false; }
+#else
+            err = "mtp: STRATA_MTP_EXPERTS_AS needs a build with native experts (ggml)";
+            return false;
+#endif
+        } else
         for (uint64_t e = 0; e < E; ++e)
             if (cudaMemcpy(experts_ + e * L.bytes, f.tensor_data(*gu) + e * gu_b, gu_b, cudaMemcpyHostToDevice) != cudaSuccess ||
                 cudaMemcpy(experts_ + e * L.bytes + gu_b, f.tensor_data(*dn) + e * d_b, d_b, cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "mtp: copying the GGUF experts";
                 return false;
             }
-        exp_gu_type_ = (int) gu->type;
-        exp_d_type_ = (int) dn->type;
+        exp_gu_type_ = L.gu_type;
+        exp_d_type_ = L.d_type;
         exp_blob_ = (int64_t) L.bytes;
         vram_ += E * L.bytes;
-        std::fprintf(stderr, "strata mtp: STRATA_MTP_EXPERTS: %llu experts %s / %s from %s (%.0f MiB)\n",
+        std::fprintf(stderr, "strata mtp: STRATA_MTP_EXPERTS: %llu experts %s / %s from %s%s (%.0f MiB)\n",
                      (unsigned long long) E, gu->type_name(), dn->type_name(), path.c_str(),
-                     (double) (E * L.bytes) / 1048576.0);
+                     req ? ", requantized to IQ4_XS / IQ4_NL (STRATA_MTP_EXPERTS_AS)" : "", (double) (E * L.bytes) / 1048576.0);
         return true;
     } catch (const std::exception& ex) {
         err = std::string("mtp: STRATA_MTP_EXPERTS: ") + ex.what();
@@ -366,6 +419,18 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     static const char* gguf_experts = std::getenv("STRATA_MTP_EXPERTS");
     if (shared == nullptr && gguf_experts != nullptr && gguf_experts[0] != '\0') {
         if (!load_gguf_experts(gguf_experts, g, err)) return false;
+        // STRATA_MTP_EXPERTS_AS: the GGUF (2.7 GB of Q8_0) was only the requant's source; drop its page cache so the
+        // expert cache is sized as it is without it (r2-e038: 18253 slots instead of 19068, which changes the texts)
+#if defined(__linux__)
+        static const char* as_env = std::getenv("STRATA_MTP_EXPERTS_AS");
+        if (as_env != nullptr && as_env[0] != '\0') {
+            const int fd = ::open(gguf_experts, O_RDONLY);
+            if (fd >= 0) {
+                ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+                ::close(fd);
+            }
+        }
+#endif
     } else if (shared == nullptr) {
         exp_blob_ = (int64_t) strata::kernels::cpu::BLOB;
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;

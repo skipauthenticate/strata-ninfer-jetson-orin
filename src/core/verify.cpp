@@ -2556,6 +2556,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     return true;
 }
 
+// ar diagnostic (profiler only): hc0 norm at layer 0 / layer 1 (the PLE flag wait sits there) / the rest, and waitCPU
+// at layer 0 / layer 1, ns summed over the windows profile_report covers
+static double g_ar_l01[5];
+
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
@@ -2578,6 +2582,14 @@ std::string Verifier::profile_report() {
     }
     std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
+    {
+        const double w = 1e6 * (double) prof_windows_;
+        char b2[160];
+        std::snprintf(b2, sizeof b2, " || ar hc0 norm L0 %.3f L1 %.3f rest %.3f, waitCPU L0 %.3f L1 %.3f ms/window",
+                      g_ar_l01[0] / w, g_ar_l01[1] / w, g_ar_l01[2] / w, g_ar_l01[3] / w, g_ar_l01[4] / w);
+        out += b2;
+        for (double& d : g_ar_l01) d = 0;
+    }
     for (int t = 0; t < 8; ++t) {   // ar: the same stages by window size (GDN + QSA layers), ms a window of that T
         const double n = (double) prof_windows_t_[t];
         if (n == 0) continue;
@@ -2840,12 +2852,14 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
             const unsigned long long x = at(l, i);
             if (x == 0 || x < prev) continue;
             prof_sum_[kind][i] += (double) (x - prev);
+            if (i == 23 && l <= 1) g_ar_l01[3 + l] += (double) (x - prev);
             prev = x;
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
         const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
         if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
             prof_sum_[kind][27] += dn;      // hc-read0: norm
+            g_ar_l01[l == 0 ? 0 : l == 1 ? 1 : 2] += dn;
             prof_sum_[kind][28] += dd;      //           down
             prof_sum_[kind][29] += du;      //           up (through both halves, as before)
             prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
