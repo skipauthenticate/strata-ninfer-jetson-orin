@@ -67,6 +67,11 @@ public:
     /// Robust costs (STRATA_SPEC_COST): a round far above the known cost of its width (a graph capture, a stall) counts
     /// as at most twice that cost, and the first samples are a running mean. Off: the cost EMA as it always was.
     void set_robust(bool on) { robust_ = on; }
+    /// ar STRATA_SPEC_STALE=N (opt-in): a width not measured for N rounds (default 300) is tried again, and that round
+    /// replaces its price instead of moving the EMA a tenth of the way. A width priced in a slow stretch (the cache-cold
+    /// first request of a workload) otherwise keeps its price for good: r3-e040's repetition requests 2-3 accepted
+    /// every lookup draft yet ran T4 only, T6 still priced at request 1's 195 ms. SPEC_COST's chain probes stale widths too.
+    void set_stale(double rounds) { stale_rounds_ = rounds; stale_reset_ = true; }
 
 private:
     static int bucket(int match);
@@ -76,6 +81,10 @@ private:
     static constexpr int kPBuckets = 8;
     std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts accepted / reached by probability bucket (decayed)
     bool robust_ = false;
+    // A size not measured for this many rounds is tried again when a confident lookup could use it: its cost was set in
+    // one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
+    double stale_rounds_ = 300.0;
+    bool stale_reset_ = false;             // set_stale: a stale width's next round replaces its price
 
     int max_t_;
     double margin_;

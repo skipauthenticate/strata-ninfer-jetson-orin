@@ -8678,6 +8678,23 @@ int main(int argc, char** argv) {
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        // ar STRATA_SPEC_STALE=N (opt-in): a width unmeasured for N rounds is retried and that round becomes its price
+        if (const char* v = std::getenv("STRATA_SPEC_STALE"); v != nullptr && std::atof(v) > 0) {
+            policy.set_stale(std::atof(v));
+            std::fprintf(stderr, "strata serve: STRATA_SPEC_STALE=%g: a window width unmeasured for that many rounds is "
+                                 "tried again and re-priced by that round\n", std::atof(v));
+        }
+        // ar STRATA_COPY_MATCH=M (opt-in, round 3 B5 copy mode): when the committed text repeats an earlier passage for
+        // >= M tokens and that copy fills an MTP window, the drafter computes draft 0 only, and if it equals the copy's
+        // first token the chain steps are skipped: the next window's lookup is then priced against a 2-row MTP window.
+        // Window choice only: the verify window decides every token, so the text is unchanged.
+        const int copy_match = [&] {
+            const char* v = std::getenv("STRATA_COPY_MATCH");
+            return v != nullptr && use_mtp && o.suffix_draft > 0 && S_mtp > 2 ? std::max(0, std::atoi(v)) : 0;
+        }();
+        if (copy_match > 0)
+            std::fprintf(stderr, "strata serve: STRATA_COPY_MATCH=%d: a prompt-lookup copy of >= %d matched tokens that "
+                                 "agrees with the MTP's first draft replaces the MTP chain\n", copy_match, copy_match);
         // ar STRATA_SPEC_COST=1 (opt-in, port of upstream 687810556): the serial loop's MTP window by expected tokens
         // per ms at the measured round costs (DraftPolicy::keep_draft after each draft step) instead of the --spec-min-p /
         // STRATA_SPEC_CUM test (it needs --spec-min-p > 0: draft()'s stepwise path). STRATA_SPEC_COST_TABLE="T1,T2,.."
@@ -10576,6 +10593,8 @@ int main(int argc, char** argv) {
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
+            bool copy_next = false;   // STRATA_COPY_MATCH: the last draft() skipped its chain for a copy
+            int64_t copy_windows = 0, copy_lookups = 0;
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
             // STRATA_DECODE_TIMING: windows by size T - count, drafts accepted, verify ms, round ms (verify+commit+draft)
@@ -11488,6 +11507,7 @@ int main(int argc, char** argv) {
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
+                if (copy_next) { ++copy_windows; copy_lookups += from_sfx; }
                 // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
                 int chain_n = 0, cm = 0;
                 if (o.lookup_chain > 0 && !first_window && !from_sfx && T < S) {
@@ -11686,8 +11706,17 @@ int main(int argc, char** argv) {
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 chain_rows = 0;   // STRATA_SPEC_COST: set by the chain rule inside draft()
+                int32_t copy_tok = -1;   // STRATA_COPY_MATCH: the copy's first token, when the copy may take the window
+                if (copy_match > 0 && req_spec_min_p > 0.0 && !eos && produced_n < max_new) {
+                    const int k = sfx.propose(S - 1, sbuf.data());
+                    // only where copies of that match length have been holding (choose()'s probe bar)
+                    if (k >= S_mtp - 1 && sfx.last_match() >= copy_match && policy.lookup_rate(sfx.last_match()) >= 0.85)
+                        copy_tok = sbuf[0];
+                    mtp.set_copy_gate(copy_tok);
+                }
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                copy_next = drafted && copy_tok >= 0 && drafts[0] == copy_tok;
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -11988,6 +12017,9 @@ int main(int argc, char** argv) {
             if (sfx_windows > 0)
                 std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
+            if (copy_match > 0)
+                std::fprintf(stderr, "strata serve: copy mode: %lld windows drafted without the MTP chain, %lld of them took "
+                                     "the copy\n", (long long) copy_windows, (long long) copy_lookups);
             if (o.lookup_chain > 0)
                 std::fprintf(stderr, "strata serve: lookup chain: %lld of %lld windows, %lld of %lld chained drafts accepted\n",
                              (long long) chain_windows, (long long) dec_windows, (long long) chain_ok, (long long) chain_drafts);
@@ -12600,6 +12632,7 @@ int main(int argc, char** argv) {
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        if (const char* v = std::getenv("STRATA_SPEC_STALE"); v != nullptr && std::atof(v) > 0) policy.set_stale(std::atof(v));
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts

@@ -561,19 +561,29 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
     // --pipeline-windows 2 (the forcing graphs): the chain shares its card with stage 1's windows and the next launch
-    // on stage 0 waits for it, so its stream gets the highest priority there (STRATA_MTP_PRIORITY=0: the default)
+    // on stage 0 waits for it, so its stream gets the highest priority there (STRATA_MTP_PRIORITY=0: the default).
+    // ar STRATA_MTP_PRIORITY=2 (opt-in): the highest priority in the serial loop too, for cs_ and the shared-expert
+    // branch side_: the verifier's async commit graph (set_commit_async) runs beside the draft round and only the next
+    // window needs it, so the draft goes first. Scheduling only: same kernels, same inputs.
+    static const int prio_mode = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr ? 1 : std::atoi(v); }();
     bool prio = false;
+    int prio_hi = 0;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)   // (HIP: the default priority)
-    static const bool hi_prio = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr || std::atoi(v) != 0; }();
-    int prio_lo = 0, prio_hi = 0;
-    if (force_on_ && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
+    int prio_lo = 0;
+    if (((force_on_ && prio_mode != 0) || prio_mode == 2) &&
+        cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
         prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
     cudaGetLastError();
+    if (prio && prio_mode == 2 && !force_on_)
+        std::fprintf(stderr, "strata mtp: STRATA_MTP_PRIORITY=2: the drafter's streams at priority %d (the verifier's "
+                             "commit graph keeps the default)\n", prio_hi);
 #endif
     if (!prio && cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
 #if !defined(STRATA_USE_HIP)
     // HIP keeps the shared expert on cs_; only CUDA needs this branch stream.
-    if (cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking) != cudaSuccess ||
+    const bool side_prio = prio && prio_mode == 2;   // ar STRATA_MTP_PRIORITY=2: the branch at cs_'s priority
+    if ((side_prio ? cudaStreamCreateWithPriority(&side_, cudaStreamNonBlocking, prio_hi)
+                   : cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking)) != cudaSuccess ||
         cudaEventCreateWithFlags(&sh_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&sh_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "mtp: streams";
@@ -1476,6 +1486,8 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
+    const int32_t copy_gate = copy_gate_;   // set_copy_gate: this call only
+    copy_gate_ = -1;
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
     // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected

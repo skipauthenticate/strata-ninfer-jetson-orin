@@ -74,6 +74,29 @@ int main() {
         check(saw6, "a stale wide size is tried again within a few hundred rounds");
     }
     {
+        // ar STRATA_SPEC_STALE (r3-e040 repetition): T6 priced in a cache-cold stretch, T5 fresh; default keeps T6 out
+        // for 80 rounds, set_stale(32) retries it after 32 and that one cheap round re-prices it for good
+        for (int mode = 0; mode < 2; ++mode) {
+            DraftPolicy p(6);
+            if (mode == 1) p.set_stale(32);
+            for (int i = 0; i < 50; ++i) p.observe(false, 4, 2, 0, cost(4));     // an MTP at 3 tokens a window
+            for (int t = 2; t <= 6; ++t) for (int i = 0; i < 4; ++i) p.observe(false, t, t - 1, 0, cost(t));
+            for (int i = 0; i < 6; ++i) p.observe(true, 6, 5, 40, 4.0 * cost(6));  // the slow stretch
+            for (int i = 0; i < 30; ++i) p.observe(true, 4, 3, 40, cost(4));
+            int first6 = -1, later6 = 0;
+            for (int i = 0; i < 80; ++i) {
+                const DraftPolicy::Pick k = p.choose(4, 5, 40);
+                if (k.lookup && k.t == 6) { if (first6 < 0) first6 = i; else ++later6; }
+                p.observe(k.lookup, k.t, k.t - 1, 40, cost(k.t));
+            }
+            if (mode == 0) check(first6 < 0, "default: the T6 priced in a slow stretch stays out for 80 rounds");
+            else {
+                check(first6 >= 0 && first6 <= 4, "STRATA_SPEC_STALE 32: the stale T6 is retried after 32 rounds");
+                check(later6 >= 70, "STRATA_SPEC_STALE: that round re-priced it, and T6 is taken from then on");
+            }
+        }
+    }
+    {
         // --lookup-chain: rows cheap (UMA-like) and the chain always accepted -> chained; rows dear or the chain
         // always rejected -> not
         auto cheap = [](int t) { return 40.0 + 2.0 * (t - 1); };

@@ -68,6 +68,10 @@ public:
     /// ar STRATA_SPEC_COST=1: draft()'s chain (its min_p > 0 path) asks rule(j, p_j) after draft j whether to compute
     /// draft j + 1, instead of the min_p / cum_ok test. Empty = that test. Drafting policy only.
     void set_chain_rule(std::function<bool(int, float)> rule) { chain_rule_ = std::move(rule); }
+    /// ar STRATA_COPY_MATCH (opt-in): the next draft()'s chain (its min_p > 0 path) stops after draft 0 when draft 0
+    /// equals `tok` (a prompt-lookup copy starting with the MTP's own first guess supplies that window). One call only:
+    /// draft() clears it. -1 = off. Drafting policy only.
+    void set_copy_gate(int32_t tok) { copy_gate_ = tok; }
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
@@ -215,6 +219,7 @@ private:
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
     std::function<bool(int, float)> chain_rule_;   // set_chain_rule
+    int32_t copy_gate_ = -1;                       // set_copy_gate
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors

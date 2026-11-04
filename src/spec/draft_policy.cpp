@@ -19,9 +19,6 @@ constexpr double kDecay = 0.97;       // lookup counts: older windows fade
 constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
 constexpr double kPriorN = 4.0;
 constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
-// A size not measured for this many rounds is tried again when a confident lookup could use it: its cost was set in
-// one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
-constexpr double kStaleRounds = 300.0;
 
 }  // namespace
 
@@ -51,7 +48,7 @@ double DraftPolicy::cost_ms(int t) const {
     return den > 0 ? num / den : kShape[t];
 }
 
-bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[t] > kStaleRounds; }
+bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[t] > stale_rounds_; }
 
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
@@ -91,6 +88,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 
 void DraftPolicy::add_cost(int t, double ms) {
     double alpha = kCostAlpha;
+    const bool reprice = stale_reset_ && stale(t);   // STRATA_SPEC_STALE: this round is the width's price now
     if (robust_) {
         if (cost_n_[t] == 0) {
             // a width's first round captures its graph: the guess from the measured widths stands in, if there is one
@@ -101,6 +99,7 @@ void DraftPolicy::add_cost(int t, double ms) {
         }
         alpha = std::max(kCostAlpha, 1.0 / (cost_n_[t] + 1.0));
     }
+    if (reprice) alpha = 1.0;
     cost_[t] = cost_n_[t] > 0 ? (1.0 - alpha) * cost_[t] + alpha * ms : ms;
     cost_n_[t] += 1.0;
     last_[t] = rounds_;
@@ -153,13 +152,15 @@ bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
             st.best_rows = rows;
         }
         // a width not measured yet is tried a few times when the chain is likely to hold that far
-        if (cost_n_[rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
+        // (STRATA_SPEC_STALE: and a width whose price has gone stale)
+        if ((cost_n_[rows] < kProbes || (stale_reset_ && stale(rows))) && st.q >= 0.15) st.best_rows = rows;
     }
     if (rows + 1 > cap) return false;   // no row left for another draft
     // one or two more drafts, each as likely to hold as this one, could they beat the best width so far?
     const double v1 = (st.e + st.q * a) / cost_ms(rows + 1);
     const double v2 = rows + 2 <= cap ? (st.e + st.q * a + st.q * a * a) / cost_ms(rows + 2) : 0.0;
-    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[rows + 1] < kProbes && st.q * a >= 0.15);
+    const bool probe = cost_n_[rows + 1] < kProbes || (stale_reset_ && stale(rows + 1));
+    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (probe && st.q * a >= 0.15);
 }
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
