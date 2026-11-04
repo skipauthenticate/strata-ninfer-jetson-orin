@@ -553,6 +553,16 @@ bool FileExpertSource::pages_cached(int64_t layer, int64_t expert) const {
     return cached_bytes(layer, expert, total, false) >= total;   // non-Linux: 0 >= 0, so every miss stays in pass 0
 }
 
+const uint8_t* FileExpertSource::slice(int64_t layer, int64_t expert, int r) const {
+    if (role_ptr_.empty() || !direct_.empty() || r < 0 || r > 2 || layer < 0 || expert < 0 || layer >= n_layers_ ||
+        expert >= n_expert_) return nullptr;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (complement_ready_ && resident_blob(index) != nullptr) return nullptr;
+    if (!override_.empty() && override_[index] != nullptr) return nullptr;
+    const size_t i = (size_t) (3 * layer + r);
+    return role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]);   // copy_from_files' slice r
+}
+
 FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     IoCounters c;
     c.cached_bytes = io_cached_.load(std::memory_order_relaxed);
@@ -3559,6 +3569,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     static const bool miss_overlap = [] { const char* v = std::getenv("STRATA_MISS_OVERLAP"); return v != nullptr && std::atoi(v) != 0; }();
     static thread_local std::vector<int64_t> cold;
     cold.clear();
+    // STRATA_MISS_ZEROCOPY=1 (native packs, the GGUF in place, aarch64): a miss whose pages are in RAM is computed
+    // straight from its three slices in the mapping (`zc`), not assembled into a stage buffer first.  The same bytes
+    // through the same per-row kernels.  Not on x86: its multi-token gate/up kernels need the assembled blob.
+    static const bool zero_copy = [] {
+#if defined(__aarch64__)
+        const char* v = std::getenv("STRATA_MISS_ZEROCOPY");
+        return v != nullptr && std::atoi(v) != 0;
+#else
+        return false;
+#endif
+    }();
+    static thread_local std::vector<int64_t> zc;
+    zc.clear();
     struct Joiner { std::thread t; ~Joiner() { if (t.joinable()) t.join(); } } cold_fill;   // joined on every return
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
         static thread_local std::vector<int64_t> miss;
@@ -3583,11 +3606,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
         }
+        if (zero_copy && native)
+            for (size_t r = 0; r < miss.size();)
+                if (d.src->slice(d.layers, miss[r], 0) != nullptr && d.src->pages_cached(d.layers, miss[r])) {
+                    zc.push_back(miss[r]);
+                    miss.erase(miss.begin() + (std::ptrdiff_t) r);
+                } else ++r;
         if (miss_overlap) {
             for (size_t r = 0; r < miss.size();)
                 if (!d.src->pages_cached(d.layers, miss[r])) { cold.push_back(miss[r]); miss.erase(miss.begin() + (std::ptrdiff_t) r); }
                 else ++r;
-            if (miss.empty()) miss.swap(cold);   // nothing to compute under the reads: one pass, as without the switch
+            if (miss.empty() && zc.empty()) miss.swap(cold);   // nothing to compute under the reads: one pass, as without the switch
             if (!cold.empty()) {   // the thread gets this thread's vector by pointer (a thread_local named there is its own)
                 ExpertSource* src = d.src;
                 const int64_t layer = d.layers, nc = (int64_t) cold.size();
@@ -3629,7 +3658,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
             if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
+                const bool z = !zc.empty() && std::find(zc.begin(), zc.end(), e) != zc.end();
+                const uint8_t* b = z ? d.src->slice(d.layers, e, 0) : d.src->blob(d.layers, e);
                 if (b == nullptr) {
                     d.failed = true;
                     d.fail = "the expert source could not produce a blob";
@@ -3641,6 +3671,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 jo = (int16_t) njobs++;
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
+                nj.up = z ? d.src->slice(d.layers, e, 1) : nullptr;     // the job slots are reused: reset for a staged blob
+                nj.down = z ? d.src->slice(d.layers, e, 2) : nullptr;
                 nj.expert_id = e;
                 nj.nt = 0;
             }

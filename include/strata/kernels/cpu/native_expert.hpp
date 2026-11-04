@@ -51,10 +51,11 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 /// below that).  1: a token's rows are the same alone and in any group.
 int native_gu_mt_min(int gu_type);
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens.
+/// `up`: the up rows when they are not at blob + f.up_off (STRATA_MISS_ZEROCOPY; the x86 multi-token kernels then step aside).
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
-                    int r0, int r1);
-/// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
+                    int r0, int r1, const uint8_t* up = nullptr);
+/// out[t][r] = down_r . hq[t] for rows r in [r0, r1).  `down`: the down rows when they are not at blob + f.down_off.
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
-                      int r0, int r1);
+                      int r0, int r1, const uint8_t* down = nullptr);
 
 }  // namespace strata::kernels::cpu

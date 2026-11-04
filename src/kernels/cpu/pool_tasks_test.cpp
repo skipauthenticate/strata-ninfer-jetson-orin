@@ -84,6 +84,23 @@ int main(int argc, char** argv) {
                     ++checks;
                 }
             }
+#if defined(__aarch64__)
+        { // STRATA_MISS_ZEROCOPY (aarch64 only): the expert from three separate slices is bitwise the assembled blob
+            std::vector<uint8_t> g(blob.begin(), blob.begin() + (std::ptrdiff_t) f.up_off),
+                u(blob.begin() + (std::ptrdiff_t) f.up_off, blob.begin() + (std::ptrdiff_t) f.down_off),
+                dn(blob.begin() + (std::ptrdiff_t) f.down_off, blob.end());
+            auto split = jobs;
+            for (auto& j : split) { j.blob = g.data(); j.up = u.data(); j.down = dn.data(); }
+            std::fill(out.begin(), out.end(), 0.0f);
+            cpu::ExpertPool pool(3, false);
+            pool.run_split_multi_native(f, split.data(), n);
+            if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) {
+                std::fprintf(stderr, "split slices mismatch n=%d\n", n);
+                return 1;
+            }
+            ++checks;
+        }
+#endif
     }
     std::printf("pool tasks: %d bitwise comparisons passed\n", checks);
     return 0;

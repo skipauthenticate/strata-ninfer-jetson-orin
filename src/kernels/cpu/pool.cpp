@@ -640,7 +640,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
                     const int nbk = (int) (nfmt_->n_embd / 64);
                     q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+                    q2_rows_any(mjobs_[e].up != nullptr ? mjobs_[e].up : mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk,
+                                mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
                     for (int t = 0; t < mjobs_[e].nt; ++t)
                         for (int r = r0; r < r1; ++r)
                             sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
@@ -654,17 +655,17 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     if (fmt.q8_1_exp2f_silu_expert >= 0 &&
                         fmt.q8_1_exp2f_silu_expert != mjobs_[e].expert_id)
                         fmt.q8_1_exp2f_silu = false;
-                    native_gu_rows(fmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    native_gu_rows(fmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1, mjobs_[e].up);
                 } else if (q2_native_kernels(nfmt_->d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
+                    q2_rows_any(mjobs_[e].down != nullptr ? mjobs_[e].down : mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
                                 mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 } else {
                     const void* hq[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1, mjobs_[e].down);
                 }
                 r += r1 - r0;
             }

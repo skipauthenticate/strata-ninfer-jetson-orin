@@ -547,11 +547,12 @@ int native_gu_mt_min(int gu_type) {
 }
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
-                    int r0, int r1) {
+                    int r0, int r1, const uint8_t* up) {
+    const uint8_t* const ub = up != nullptr ? up : blob + f.up_off;
     if (q8_1_scalar_dot(f)) {
         for (int r = r0; r < r1; ++r) {
             const uint8_t* gr = blob + (size_t) r * f.gu_row;
-            const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+            const uint8_t* ur = ub + (size_t) r * f.gu_row;
             for (int t = 0; t < nt; ++t) {
                 const auto* xq = (const uint8_t*) act[t];
                 const auto dot = f.gu_type == GGML_TYPE_IQ2_S ? q8_1_iq2_s_cuda_dot :
@@ -592,7 +593,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
-    if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
+    if (up == nullptr && kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
@@ -600,7 +601,8 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
     // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
     static const bool cpu512 = cpu_avx512_ok();
-    if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
+    // these take the contiguous blob (up rows at up_off); split slices are aarch64-only (the dispatch), never here
+    if (up == nullptr && nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
@@ -615,7 +617,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     const int n = (int) f.n_embd;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
-        const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+        const uint8_t* ur = ub + (size_t) r * f.gu_row;
         for (int t = 0; t < nt; ++t) {
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
@@ -626,10 +628,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 }
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
-                      int r0, int r1) {
+                      int r0, int r1, const uint8_t* down) {
+    const uint8_t* const db = down != nullptr ? down : blob + f.down_off;
     if (q8_1_scalar_dot(f)) {
         for (int r = r0; r < r1; ++r) {
-            const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
+            const uint8_t* dr = db + (size_t) r * f.d_row;
             for (int t = 0; t < nt; ++t) {
                 out[t][r] = f.d_type == GGML_TYPE_Q2_0
                     ? q8_1_q2_0_cuda_dot(dr, (const uint8_t*) hq[t], (int) f.n_ff)
@@ -648,18 +651,18 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
     if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
-        kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        kq256_rows(f.d_type, db, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     if (cpu_avx2_ok() && nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
-        iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        iq4nl256_down_rows(db, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
 #endif
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
     for (int r = r0; r < r1; ++r) {
-        const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
+        const uint8_t* dr = db + (size_t) r * f.d_row;
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);
