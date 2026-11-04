@@ -28,6 +28,12 @@
 #include <mutex>
 #include <vector>
 
+#if defined(__aarch64__) && defined(__linux__) && defined(__GNUC__)
+#include <arm_neon.h>
+#include <sys/auxv.h>
+#define STRATA_IQ3S_NEON_MT_BUILD 1
+#endif
+
 namespace strata::kernels::cpu {
 namespace {
 
@@ -396,6 +402,113 @@ void init_once() {
     std::call_once(once, [] { ggml_cpu_init(); });
 }
 
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+// STRATA_IQ3S_NEON_MT=1|2 (opt-in, aarch64 Linux): an expert's IQ3_S gate/up rows for its 2..MAXT window tokens with
+// each 256-weight block decoded once for all of them (ggml's dot decodes it again for every token).  Per token every
+// step is ggml's NEON ggml_vec_dot_iq3_s_q8_K: the same signed grid bytes, exact integer sums (lane order cannot
+// matter in integers), and per block `sumf += d*(sumi1 + sumi2)` with d = fp16(x.d) * y.d.  That one float step is
+// what ggml's build may compile either way: mode 1 = one fused multiply-add (GCC's default contraction in gnu11 C),
+// mode 2 = a rounded multiply, then the add.  The served texts-identical gate decides which one is ggml's.
+int iq3s_neon_mt_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_IQ3S_NEON_MT");
+        const int m = v != nullptr ? std::atoi(v) : 0;
+        if (m != 1 && m != 2) return 0;
+        if ((getauxval(AT_HWCAP) & (1UL << 20)) == 0) {   // HWCAP_ASIMDDP: the dot-product instructions
+            std::fprintf(stderr, "strata native experts: STRATA_IQ3S_NEON_MT=%d ignored: this CPU has no dot product\n", m);
+            return 0;
+        }
+        std::fprintf(stderr, "strata native experts: STRATA_IQ3S_NEON_MT=%d: IQ3_S gate/up rows decode each block once "
+                             "for 2-%d tokens (%s)\n", m, MAXT, m == 1 ? "fused multiply-add accumulate" : "multiply, then add");
+        return m;
+    }();
+    return mode;
+}
+
+#pragma GCC push_options
+#pragma GCC target("arch=armv8.2-a+dotprod")
+// out[t] = ggml_vec_dot_iq3_s_q8_K(n, row, act[t]) for t < nt (ggml-cpu/arch/arm/quants.c, the __ARM_NEON branch)
+void iq3s_dot_mt(const uint8_t* row, const void* const* act, int nt, int n, int mode, float* out) {
+    static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+                                        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03};
+    static const uint8_t k_mask2[16] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+    static const int16_t k_shift[8] = {8, 7, 6, 5, 4, 3, 2, 1};
+    const uint8x16_t mask1_0 = vld1q_u8(k_mask1), mask1_1 = vld1q_u8(k_mask1 + 16);
+    const uint8x16_t mask2 = vld1q_u8(k_mask2);
+    const int16x8_t hshift = vld1q_s16(k_shift);
+    const uint16x8_t m256 = vdupq_n_u16(256);
+    const uint8x16_t m1 = vdupq_n_u8(1);
+    const auto* x = reinterpret_cast<const block_iq3_s*>(row);
+    const int nb = n / QK_K;
+    float sumf[MAXT];
+    for (int t = 0; t < nt; ++t) sumf[t] = 0.f;
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* qs = x[i].qs;
+        const uint8_t* qh = x[i].qh;
+        const uint8_t* sg = x[i].signs;
+        uint32_t scales32[2];
+        std::memcpy(scales32, x[i].scales, 4);
+        scales32[1] = (((scales32[0] >> 4) & 0x0f0f0f0f) << 1) | 0x01010101;
+        scales32[0] = ((scales32[0] & 0x0f0f0f0f) << 1) | 0x01010101;
+        const auto* scales8 = reinterpret_cast<const uint8_t*>(scales32);
+        int sumi1[MAXT], sumi2[MAXT];
+        for (int t = 0; t < nt; ++t) sumi1[t] = sumi2[t] = 0;
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            uint16_t idx[8];
+            const uint8x16_t idx_l = vld1q_u8(qs);
+            qs += 16;
+            vst1q_u16(idx, vorrq_u16(vmovl_u8(vget_low_u8(idx_l)),
+                                     vandq_u16(vshlq_u16(vdupq_n_u16(qh[ib32 + 0]), hshift), m256)));
+            const uint32_t a0[4] = {iq3s_grid[idx[0]], iq3s_grid[idx[1]], iq3s_grid[idx[2]], iq3s_grid[idx[3]]};
+            const uint32_t a1[4] = {iq3s_grid[idx[4]], iq3s_grid[idx[5]], iq3s_grid[idx[6]], iq3s_grid[idx[7]]};
+            vst1q_u16(idx, vorrq_u16(vmovl_u8(vget_high_u8(idx_l)),
+                                     vandq_u16(vshlq_u16(vdupq_n_u16(qh[ib32 + 1]), hshift), m256)));
+            const uint32_t a2[4] = {iq3s_grid[idx[0]], iq3s_grid[idx[1]], iq3s_grid[idx[2]], iq3s_grid[idx[3]]};
+            const uint32_t a3[4] = {iq3s_grid[idx[4]], iq3s_grid[idx[5]], iq3s_grid[idx[6]], iq3s_grid[idx[7]]};
+            uint16_t s16[4];
+            std::memcpy(s16, sg, sizeof(s16));
+            sg += sizeof(s16);
+            int8x16_t q3s[4];
+            uint8x16_t vs0 = vreinterpretq_u8_u32(vdupq_n_u32(s16[0] | ((uint32_t) s16[1] << 16)));
+            uint8x16_t vs1 = vandq_u8(vqtbl1q_u8(vs0, mask1_1), mask2);
+            vs0 = vandq_u8(vqtbl1q_u8(vs0, mask1_0), mask2);
+            vs0 = vorrq_u8(vceqq_u8(vs0, mask2), m1);
+            vs1 = vorrq_u8(vceqq_u8(vs1, mask2), m1);
+            q3s[0] = vmulq_s8(vreinterpretq_s8_u8(vs0), vreinterpretq_s8_u32(vld1q_u32(a0)));
+            q3s[1] = vmulq_s8(vreinterpretq_s8_u8(vs1), vreinterpretq_s8_u32(vld1q_u32(a1)));
+            vs0 = vreinterpretq_u8_u32(vdupq_n_u32(s16[2] | ((uint32_t) s16[3] << 16)));
+            vs1 = vandq_u8(vqtbl1q_u8(vs0, mask1_1), mask2);
+            vs0 = vandq_u8(vqtbl1q_u8(vs0, mask1_0), mask2);
+            vs0 = vorrq_u8(vceqq_u8(vs0, mask2), m1);
+            vs1 = vorrq_u8(vceqq_u8(vs1, mask2), m1);
+            q3s[2] = vmulq_s8(vreinterpretq_s8_u8(vs0), vreinterpretq_s8_u32(vld1q_u32(a2)));
+            q3s[3] = vmulq_s8(vreinterpretq_s8_u8(vs1), vreinterpretq_s8_u32(vld1q_u32(a3)));
+            for (int t = 0; t < nt; ++t) {
+                const int8_t* q8 = reinterpret_cast<const block_q8_K*>(act[t])[i].qs + 32 * ib32;
+                const int32x4_t p1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), q3s[0], vld1q_s8(q8)), q3s[1], vld1q_s8(q8 + 16));
+                const int32x4_t p2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), q3s[2], vld1q_s8(q8 + 32)), q3s[3], vld1q_s8(q8 + 48));
+                sumi1[t] += vaddvq_s32(p1) * scales8[ib32 / 2 + 0];
+                sumi2[t] += vaddvq_s32(p2) * scales8[ib32 / 2 + 4];
+            }
+        }
+        const float xd = ggml_fp16_to_fp32(x[i].d);
+        for (int t = 0; t < nt; ++t) {
+            const float d = xd * reinterpret_cast<const block_q8_K*>(act[t])[i].d;
+            const float s = (float) (sumi1[t] + sumi2[t]);
+            if (mode == 1) {
+                sumf[t] = std::fma(d, s, sumf[t]);
+            } else {
+                float p = d * s;
+                __asm__ volatile("" : "+w"(p));   // keep the multiply rounded: no contraction into the add
+                sumf[t] = sumf[t] + p;
+            }
+        }
+    }
+    for (int t = 0; t < nt; ++t) out[t] = sumf[t];
+}
+#pragma GCC pop_options
+#endif
+
 }  // namespace
 
 bool native_experts_available() noexcept { return true; }
@@ -437,6 +550,9 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.d_type = d_type;
     f.gu_act = (int) tg->vec_dot_type;
     f.d_act = (int) td->vec_dot_type;
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+    if (gu_type == GGML_TYPE_IQ3_S) (void) iq3s_neon_mt_mode();   // its startup line, once
+#endif
     const char* q8_1_probe = std::getenv("STRATA_NATIVE_CPU_Q8_1_DOT");
     if (q8_1_probe != nullptr && !q8_1_selector_known(q8_1_probe)) {
         err = "native experts: STRATA_NATIVE_CPU_Q8_1_DOT must be 0, 1, all, a supported GU/DOWN pair "
@@ -609,6 +725,20 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         }
         if (avx2 && iq256_supported(f.gu_type)) {
             iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            return;
+        }
+    }
+#endif
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+    // one token keeps ggml's own dot (nothing to share); 2..MAXT tokens share each block's decode
+    if (nt >= 2 && nt <= MAXT && f.gu_type == GGML_TYPE_IQ3_S && f.gu_act == GGML_TYPE_Q8_K) {
+        if (const int mode = iq3s_neon_mt_mode(); mode != 0) {
+            float g[MAXT], u[MAXT];
+            for (int r = r0; r < r1; ++r) {
+                iq3s_dot_mt(blob + (size_t) r * f.gu_row, act, nt, (int) f.n_embd, mode, g);
+                iq3s_dot_mt(ub + (size_t) r * f.gu_row, act, nt, (int) f.n_embd, mode, u);
+                for (int t = 0; t < nt; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+            }
             return;
         }
     }
