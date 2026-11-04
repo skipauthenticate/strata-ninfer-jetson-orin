@@ -1,0 +1,1 @@
+{"args": {"--expert-profile": "/home/<user>/strata/Strata-data/profiles/iq3_s-mixed-r3.bin", "--lookup-chain": "4"}, "env": {"STRATA_DECODE_TIMING": "1", "STRATA_SPEC_DEPTH": "1"}}

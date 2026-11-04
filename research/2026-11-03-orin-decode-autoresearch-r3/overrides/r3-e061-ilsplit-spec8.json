@@ -1,0 +1,1 @@
+{"args": {"--expert-profile": "/home/<user>/strata/Strata-data/profiles/iq3_s-warm.bin", "--spec": "8"}, "env": {"STRATA_IL56": "1", "STRATA_IL_SPLIT": "1", "STRATA_DECODE_TIMING": "1", "STRATA_SPEC_DEPTH": "1"}}

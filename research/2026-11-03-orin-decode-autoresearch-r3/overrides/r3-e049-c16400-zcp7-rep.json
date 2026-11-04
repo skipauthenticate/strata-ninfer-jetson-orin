@@ -1,0 +1,1 @@
+{"args": {"--expert-profile": "/home/<user>/strata/Strata-data/profiles/iq3_s-warm.bin", "--expert-cache": "16400", "--pool-workers": "7"}, "env": {"STRATA_MISS_ZEROCOPY": "1"}}

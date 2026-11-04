@@ -1,0 +1,1 @@
+{"args": {"--expert-profile": "/home/<user>/strata/Strata-data/profiles/iq3_s-warm.bin", "--pool-workers": "7", "--adapt-every": "16"}, "env": {"STRATA_MISS_ZEROCOPY": "1", "STRATA_ADAPT_LAG": "2", "STRATA_IL56": "1", "STRATA_SPEC_STALE": "32", "STRATA_COPY_MATCH": "12", "STRATA_DECODE_TIMING": "1", "STRATA_SPEC_DEPTH": "1"}}

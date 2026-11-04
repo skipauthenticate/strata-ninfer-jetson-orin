@@ -1,6 +1,6 @@
 # Using the fast build
 
-How to run IQ3_S with this branch's engine and the best settings found so far (round 2, `r2-e043`) on a Jetson AGX
+How to run IQ3_S with this branch's engine and the best settings found so far (round 3, `r3-e047`) on a Jetson AGX
 Orin 64 GB. It assumes IQ3_S is already installed with setup at a 262,144-token context (`strata-iq3_s.json` exists).
 
 1. Build the engine from this branch with setup's flags, in its own folder so the stock engine stays:
@@ -40,7 +40,9 @@ Orin 64 GB. It assumes IQ3_S is already installed with setup at a 262,144-token 
    The configuration adds `--expert-profile <profile.bin> --adapt-every 100000 --kv-grow --expert-cache 14629
    --mtp-hnorm stream`, round 1's twelve `STRATA_*` switches, and round 2's five: `STRATA_SPEC_CUM=0,0.40,0.47`,
    `STRATA_IO_PREFETCH=1`, `STRATA_MTP_EXPERTS=<mtp-q8_0.gguf>`, `STRATA_MTP_EXPERTS_AS=iq4_xs`,
-   `STRATA_HC_DOWN_RR=1`. Leave out the fourth argument to get round 1's settings without the draft head. The
+   `STRATA_HC_DOWN_RR=1`, and round 3's four: `--pool-workers 7`, `STRATA_MISS_ZEROCOPY=1`, `STRATA_SPEC_COST=1`,
+   `STRATA_SPEC_COST_TABLE=52.5,63.5,74.5,86.7`. Leave out the fourth argument to get round 1's settings without the
+   draft head. The
    diagnostic switches the runs also set (`STRATA_DECODE_TIMING`, `STRATA_BW_PROBE`) are not included.
 
 ## Verified
@@ -50,14 +52,21 @@ Through the start script (`serve/server.py`), with the community `benchmark.py` 
 
 | | Decode tok/s, median [range] | Prompt tok/s | TTFT s | 32K needles |
 | --- | ---: | ---: | ---: | --- |
+| Round 3 settings, engine at commit `8f6ecdcd` (SHA-256 `69995077…`), 2026-11-04 | 36.98 [34.41–36.99] | 333.6 | 12.34 | 3/3 |
 | Round 2 settings, engine at commit `8d466b5d` (SHA-256 `a6851e0a…`) | 34.89 [33.76–35.23] | 346.9 | 11.87 | 3/3 |
 | Round 1 settings, engine SHA-256 `896d4c7a…` | 33.28 [32.39–34.87] | 301.3 | 13.65 | 3/3 |
 | Stock engine, setup's default (2026-11-01 report) | 23.7 [21.3–26.7] | 234.7 | 17.5 | 3/3 |
+
+With round 3's settings the same server session also ran round 3's prose and repetition workloads: 25.72 and 31.12
+tok/s (round 2's settings: 18.4–18.6 and 16.4–16.6). The output text was identical to round 3's baselines on all
+nine prompts, and the minimum free memory was 11.96 GiB (two idle services were stopped on the board; with them
+running, round 2 measured 7.03). Files: [verify-r3-summary.json](verify-r3-summary.json),
+[verify-r3-needles.json](verify-r3-needles.json).
 
 With round 2's settings, the output text was identical to round 2's baselines on all three prompts, and the minimum
 free memory was 7.03 GiB (round 1: 7.46). Files: [verify-r2-summary.json](verify-r2-summary.json),
 [verify-r2-needles.json](verify-r2-needles.json); round 1's are [verify-summary.json](verify-summary.json) and
 [verify-needles.json](verify-needles.json).
 
-The caveats in the [main README](../README.md#caveats) and [round 2's](../../2026-11-01-orin-decode-autoresearch-r2/README.md#caveats)
-apply: the bit-exact check has not been run, and the warm profile matches the workload it was captured on.
+The caveats in the [main README](../README.md#caveats), [round 2's](../../2026-11-01-orin-decode-autoresearch-r2/README.md#caveats)
+and [round 3's](../../2026-11-03-orin-decode-autoresearch-r3/README.md#caveats) apply: the bit-exact check has not been run, and the warm profile matches the workload it was captured on.

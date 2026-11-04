@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """strata-iq3_s-fast.json from setup's strata-iq3_s.json: the decode-speed engine and the overnight best settings
 (e096), without the two diagnostic switches (STRATA_DECODE_TIMING, STRATA_BW_PROBE). With a draft-head GGUF (4th
-argument, mtp-q8_0.gguf), also round 2's best settings (r2-e043).
+argument, mtp-q8_0.gguf), also round 2's best settings (r2-e043) and round 3's (r3-e047).
 usage: make_fast_config.py <strata folder> <engine> <profile.bin> [<mtp-q8_0.gguf>]"""
 import json
 import sys
@@ -18,6 +18,8 @@ while i < len(args):
         pairs.append([args[i], None]); i += 1
 set_ = {"--expert-profile": profile, "--adapt-every": "100000", "--kv-grow": None, "--expert-cache": "14629",
         "--mtp-hnorm": "stream"}
+if draft_head:
+    set_["--pool-workers"] = "7"  # round 3: 7 CPU workers for expert misses
 pairs = [p for p in pairs if p[0] not in set_] + [[k, v] for k, v in set_.items()]
 cfg["args"] = [x for p in pairs for x in p if x is not None]
 cfg["exe"] = engine
@@ -29,6 +31,9 @@ cfg["env"] = {"STRATA_GR_FAST": "1", "STRATA_DRAFT_VOCAB_TOP": "40960",
               "STRATA_ATTN_PRE75": "1", "STRATA_EXP_PF": "1", "STRATA_HC_DOWN_WPB": "21", "STRATA_HC_UP_PF": "48"}
 if draft_head:
     cfg["env"].update({"STRATA_SPEC_CUM": "0,0.40,0.47", "STRATA_IO_PREFETCH": "1", "STRATA_MTP_EXPERTS": draft_head,
-                       "STRATA_MTP_EXPERTS_AS": "iq4_xs", "STRATA_HC_DOWN_RR": "1"})
+                       "STRATA_MTP_EXPERTS_AS": "iq4_xs", "STRATA_HC_DOWN_RR": "1",
+                       # round 3
+                       "STRATA_MISS_ZEROCOPY": "1", "STRATA_SPEC_COST": "1",
+                       "STRATA_SPEC_COST_TABLE": "52.5,63.5,74.5,86.7"})
 (repo / "strata-iq3_s-fast.json").write_text(json.dumps(cfg, indent=1) + "\n")
 print(" ".join(cfg["args"]))

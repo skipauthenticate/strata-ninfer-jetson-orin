@@ -1,0 +1,1 @@
+{"args": {"--expert-profile": "/home/<user>/strata/Strata-data/profiles/iq3_s-warm.bin", "--adapt-every": "16"}, "env": {"STRATA_ADAPT_LAG": "2"}}

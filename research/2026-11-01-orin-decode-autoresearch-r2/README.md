@@ -5,6 +5,9 @@ started from round 1's best settings, aimed much higher (90 tok/s), and was told
 kernel tuning. Same board (JetPack 7, CUDA 13.2), same model, same rules: lossless only, a fixed 262,144-token
 context, and a change is kept only if the output text stays identical.
 
+A third round on 2026-11-03 measured three workloads and reached 36.98 tok/s on this benchmark: see
+[../2026-11-03-orin-decode-autoresearch-r3](../2026-11-03-orin-decode-autoresearch-r3/README.md).
+
 ## Result
 
 Qwen3.8-Flash-Next IQ3_S, int8 KV. Decode is the engine-reported rate, the median of three fresh 4,096-token prompts
