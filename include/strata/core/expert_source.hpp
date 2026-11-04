@@ -197,6 +197,8 @@ public:
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
+    /// STRATA_MISS_OVERLAP: whether `blob` would find this expert's bytes in RAM now (no drive read); true by default.
+    virtual bool pages_cached(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return true; }
     /// CS-T: the experts of `layer` a predictor expects next - a source that reads a file may start reading their
     /// pages now, in the background.  Only warms: what `blob` returns is unchanged.  Default: nothing.
     virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -633,6 +635,8 @@ public:
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
+    /// Mapped reads (no unbuffered handle): the RAM copy, an exchange, or a sampled mincore of the blob's pages.
+    bool pages_cached(int64_t layer, int64_t expert) const override;
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
     /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;

@@ -544,6 +544,15 @@ uint64_t FileExpertSource::cached_bytes(int64_t layer, int64_t expert, uint64_t&
 #endif
 }
 
+bool FileExpertSource::pages_cached(int64_t layer, int64_t expert) const {
+    if (!staged() || !direct_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return true;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (complement_ready_ && resident_blob(index) != nullptr) return true;
+    if (!override_.empty() && override_[index] != nullptr) return true;
+    uint64_t total = 0;
+    return cached_bytes(layer, expert, total, false) >= total;   // non-Linux: 0 >= 0, so every miss stays in pass 0
+}
+
 FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     IoCounters c;
     c.cached_bytes = io_cached_.load(std::memory_order_relaxed);
@@ -3545,6 +3554,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
+    // STRATA_MISS_OVERLAP=1: the misses whose pages are not in RAM (`cold`) are read on a thread while the pool computes
+    // the others (pass 0), then computed (pass 1).  Same blobs, same kernels, each row whole in one task: same bits.
+    static const bool miss_overlap = [] { const char* v = std::getenv("STRATA_MISS_OVERLAP"); return v != nullptr && std::atoi(v) != 0; }();
+    static thread_local std::vector<int64_t> cold;
+    cold.clear();
+    struct Joiner { std::thread t; ~Joiner() { if (t.joinable()) t.join(); } } cold_fill;   // joined on every return
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
         static thread_local std::vector<int64_t> miss;
         miss.clear();
@@ -3568,20 +3583,36 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
         }
+        if (miss_overlap) {
+            for (size_t r = 0; r < miss.size();)
+                if (!d.src->pages_cached(d.layers, miss[r])) { cold.push_back(miss[r]); miss.erase(miss.begin() + (std::ptrdiff_t) r); }
+                else ++r;
+            if (miss.empty()) miss.swap(cold);   // nothing to compute under the reads: one pass, as without the switch
+            if (!cold.empty()) {   // the thread gets this thread's vector by pointer (a thread_local named there is its own)
+                ExpertSource* src = d.src;
+                const int64_t layer = d.layers, nc = (int64_t) cold.size();
+                const int64_t* cp = cold.data();
+                cold_fill.t = std::thread([src, layer, cp, nc] { src->prefetch(layer, cp, nc); });
+            }
+        }
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
     int njobs = 0;
+    auto is_cold = [&](int64_t e) { return std::find(cold.begin(), cold.end(), e) != cold.end(); };
+    // pass 0: every row but the cold misses'; pass 1: only those (their blobs have landed)
+    auto build = [&](int pass) -> bool {
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
             const int64_t e = ids[i];
             float* row = out + (size_t) i * H;
+            if (pass == 1 && (kind[i] >= 0 || !is_cold(e))) continue;
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";
                 d.fail_layer = d.layers;
                 d.fail_expert = e;
-                return;
+                return false;
             }
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
@@ -3594,6 +3625,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
             }
+            if (pass == 0 && !cold.empty() && is_cold(e)) continue;
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
             if (jo < 0) {
@@ -3604,7 +3636,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     d.fail_layer = d.layers;
                     d.fail_expert = e;
                     ++d.missing;
-                    return;
+                    return false;
                 }
                 jo = (int16_t) njobs++;
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
@@ -3619,11 +3651,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++jb.nt;
             ++d.multi_entries;
         }
+    return true;
+    };
+    if (!build(0)) return;
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
-    if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    auto run_jobs = [&](int j0) {
+        if (njobs <= j0) return;
+        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data() + j0, njobs - j0);
+        else d.pool->run_split_multi(d.jobs_multi.data() + j0, njobs - j0);
+    };
+    run_jobs(0);
+    double cold_wait_ms = 0;   // counted as `jobs` (waiting on reads), not `CPU`
+    if (!cold.empty()) {
+        const auto w0 = std::chrono::steady_clock::now();
+        cold_fill.t.join();
+        const int j0 = njobs;
+        const bool ok = build(1);
+        cold_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+        if (!ok) return;
+        run_jobs(j0);
     }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
@@ -3649,8 +3696,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
-    d.ms_jobs += ms(c2, c3);
-    d.ms_run += ms(c3, c4);
+    d.ms_jobs += ms(c2, c3) + cold_wait_ms;
+    d.ms_run += ms(c3, c4) - cold_wait_ms;
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
