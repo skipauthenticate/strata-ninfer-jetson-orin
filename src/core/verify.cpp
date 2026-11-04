@@ -222,6 +222,33 @@ inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv
 // fork F4 (Eddoursul): 2-4 token dense projections read an interleaved copy of the q8_1 activations (bitwise the same
 // outputs); STRATA_MMVQ_IL=0 keeps native_mmvq's multi-column kernels
 inline bool g_mmvq_il() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL"); return v == nullptr || v[0] != '0'; }(); return on; }
+// ar opt-in STRATA_IL_SPLIT=1: a window wider than the interleaved kernels (7-8 columns with STRATA_IL56, 5-8 without)
+// runs a dense GEMV as two interleaved passes, columns 0-3 then 4..n-1, instead of native_mmvq's one 7-8 column pass
+// (r3-e004: T6 -> T7 verify +25-35 ms, ~+20 of it dense). Every kernel here gives a column its single-column dot
+// (native_mmvq_il is bitwise native_mmvq, whose columns do not depend on how many it takes: spec 8 texts = spec 4's in
+// r3-e004), so the output is the same bits; the weights are read twice, at the 4-column kernel's speed.
+inline bool g_il_split() { static const bool on = [] { const char* v = std::getenv("STRATA_IL_SPLIT"); return v != nullptr && v[0] == '1'; }(); return on; }
+inline bool il_split_wanted(int type, int n, int n_out) {
+    return g_il_split() && g_mmvq_il() && n > strata::kernels::native_mmvq_il_max_cols() && n <= 8 &&
+           strata::kernels::native_mmvq_il_supported(type, 4, n_out);
+}
+// xil holds two 4-column interleaved copies, the second at xil + half; `ready`: both are xq's (columns 0-3, 4..n-1)
+inline void il_split_mm(int type, const void* wd, const uint8_t* xq, uint8_t* xil, size_t half, bool& ready, float* out,
+                        int n_in, int n_out, int n, void* cs) {
+    namespace K = strata::kernels;
+    const int m = n - 4;
+    const uint8_t* xq_b = xq + K::native_q8_1_bytes(n_in, 4);
+    uint8_t* xil_b = xil + half;
+    if (!ready) {
+        K::native_q8_1_interleave(xq, xil, n_in, 4, cs);
+        if (m >= 2) K::native_q8_1_interleave(xq_b, xil_b, n_in, m, cs);
+        ready = true;
+    }
+    K::native_mmvq_il(type, wd, xq, xil, out, n_in, n_out, 4, cs);
+    float* out_b = out + (size_t) 4 * n_out;
+    if (m >= 2) K::native_mmvq_il(type, wd, xq_b, xil_b, out_b, n_in, n_out, m, cs);   // native_mmvq where IL is not taken
+    else K::native_mmvq(type, wd, xq_b, out_b, n_in, n_out, m, cs);
+}
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
@@ -1182,7 +1209,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
-        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, strata::kernels::native_mmvq_il_max_cols()));
+        // STRATA_IL_SPLIT: two 4-column copies (= one 8-column copy's bytes)
+        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, g_il_split() ? 8 : strata::kernels::native_mmvq_il_max_cols()));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -1251,6 +1279,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    if (g_il_split())
+        std::fprintf(stderr, "strata verify: STRATA_IL_SPLIT=1: windows of %d-8 columns run the interleaved dense GEMVs "
+                             "and the head as two passes (columns 0-3, then the rest)\n",
+                     strata::kernels::native_mmvq_il_max_cols() + 1);
     {
         const int32_t one = 1;
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -1380,6 +1412,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
     const int64_t HV = g.ssm_v_heads, HK = g.ssm_k_heads, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
     const int64_t IQ = g.idx_q_heads, ID = g.idx_key_dim, NE = g.n_expert, MT = max_t_;
+    // STRATA_IL_SPLIT: the second 4-column copy's offset in xil_ (the carve's max_in)
+    const size_t il_half = g_il_split() ? native_q8_1_il_bytes((int) std::max<int64_t>(std::max<int64_t>(N, ZV), NH * HD), 4) : 0;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
@@ -1691,6 +1725,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         float* xm = mixed_ + tb * N;
         bool il_ready = false;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
         auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
+            if (il_split_wanted(w->native_type, n, n_out)) {
+                il_split_mm(w->native_type, w->native_data, xq_, xil_, il_half, il_ready, out, n_in, n_out, n, cs);
+                return;
+            }
             if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
                 if (!il_ready) {
                     strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, n, cs);
@@ -2529,7 +2567,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
+                if (il_split_wanted(head_->type(), (int) T, (int) n_vocab_)) {
+                    bool head_il = false;
+                    il_split_mm(head_->type(), head_->weights(), xq_, xil_, il_half, head_il, head_logits_, (int) N,
+                                (int) n_vocab_, (int) T, cs);
+                } else if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
                     strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,
                                                     (int) n_vocab_, (int) T, cs);
