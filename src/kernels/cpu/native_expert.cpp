@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cerrno>
 #include <climits>
@@ -507,6 +508,213 @@ void iq3s_dot_mt(const uint8_t* row, const void* const* act, int nt, int n, int 
     for (int t = 0; t < nt; ++t) out[t] = sumf[t];
 }
 #pragma GCC pop_options
+
+// STRATA_MISS_REPLICA_CHECK=1 (diagnostic, read-only): every quantity of the CPU-miss path that ggml-cpu (or this file's
+// SiLU line) rounds is recomputed here with explicit operations, one replica per guess of how the compiler built the
+// float steps, and the bit-equal results are counted.  It answers whether a GPU port of the miss path can round exactly
+// like the CPU (texts identical) and which form to port: Q8_K of x (the magic-bias add fused into the scale multiply or
+// not), the IQ3_S x Q8_K dot (iq3s_dot_mt at one token, modes 1/2), expf (glibc's e_expf.c algorithm, its polynomial
+// with or without fused multiply-adds), Q8_0 of h (one form: ggml's NEON body is multiplies and a nearest-even convert)
+// and the IQ4_NL x Q8_0 dot (three forms of its block-pair line).  The engine keeps using ggml's results.
+enum { RC_Q8K = 0, RC_IQ3S, RC_EXP, RC_Q80, RC_IQ4NL, RC_N };
+constexpr int RC_FORMS = 3;
+std::atomic<unsigned long long> rc_ok[RC_N][RC_FORMS];
+std::atomic<unsigned long long> rc_all[RC_N];
+
+bool replica_check() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MISS_REPLICA_CHECK");
+        if (v == nullptr || v[0] != '1') return false;
+        if ((getauxval(AT_HWCAP) & (1UL << 20)) == 0) {   // iq3s_dot_mt needs the dot-product instructions
+            std::fprintf(stderr, "strata native experts: STRATA_MISS_REPLICA_CHECK=1 ignored: this CPU has no dot product\n");
+            return false;
+        }
+        std::fprintf(stderr, "strata native experts: STRATA_MISS_REPLICA_CHECK=1: counting bit-equal replicas of the CPU "
+                             "miss path (lines `strata replica check:`)\n");
+        return true;
+    }();
+    return on;
+}
+
+void rc_print() {
+    const auto ok = [](int p, int m) { return rc_ok[p][m].load(std::memory_order_relaxed); };
+    const auto all = [](int p) { return rc_all[p].load(std::memory_order_relaxed); };
+    std::fprintf(stderr, "strata replica check (bit-equal of total): q8_K(x) rows %llu: fused %llu, split %llu | iq3_s dots "
+                         "%llu: fma %llu, mul+add %llu | expf %llu: fma poly %llu, split poly %llu | q8_0(h) rows %llu: "
+                         "%llu | iq4_nl dots %llu: fma(X,C,Y*F) %llu, X*C+Y*F %llu, fma(Y,F,X*C) %llu\n",
+                 all(RC_Q8K), ok(RC_Q8K, 0), ok(RC_Q8K, 1), all(RC_IQ3S), ok(RC_IQ3S, 0), ok(RC_IQ3S, 1), all(RC_EXP),
+                 ok(RC_EXP, 0), ok(RC_EXP, 1), all(RC_Q80), ok(RC_Q80, 0), all(RC_IQ4NL), ok(RC_IQ4NL, 0),
+                 ok(RC_IQ4NL, 1), ok(RC_IQ4NL, 2));
+}
+
+void rc_add(int piece, const unsigned long long* ok, unsigned long long n) {
+    for (int m = 0; m < RC_FORMS; ++m)
+        if (ok[m] != 0) rc_ok[piece][m].fetch_add(ok[m], std::memory_order_relaxed);
+    const unsigned long long before = rc_all[piece].fetch_add(n, std::memory_order_relaxed);
+    // a cumulative line at the first gate/up rows and then every 2^23 dots (the server is stopped by a signal)
+    if (piece == RC_IQ3S && (before == 0 || (before >> 23) != ((before + n) >> 23))) rc_print();
+}
+
+uint32_t fbits(float v) { uint32_t b; std::memcpy(&b, &v, 4); return b; }
+void keep_rounded(float& v) { __asm__ volatile("" : "+w"(v)); }    // no contraction across this point
+void keep_rounded(double& v) { __asm__ volatile("" : "+w"(v)); }
+
+// ggml-quants.c quantize_row_q8_K_ref; nearest_int(iscale*x) = the magic-bias add, fused into the multiply or not
+void rep_q8k(const float* x, block_q8_K* y, int64_t k, bool fused) {
+    for (int64_t i = 0; i < k / QK_K; ++i, x += QK_K) {
+        float max = 0, amax = 0;
+        for (int j = 0; j < QK_K; ++j) {
+            const float ax = std::fabs(x[j]);
+            if (ax > amax) { amax = ax; max = x[j]; }
+        }
+        if (!amax) { y[i].d = 0; std::memset(y[i].qs, 0, QK_K); continue; }
+        const float iscale = -127.f / max;
+        for (int j = 0; j < QK_K; ++j) {
+            float val;
+            if (fused) {
+                val = std::fma(iscale, x[j], 12582912.f);
+            } else {
+                float p = iscale * x[j];
+                keep_rounded(p);
+                val = p + 12582912.f;
+            }
+            const int v = (int) (fbits(val) & 0x007fffff) - 0x00400000;
+            y[i].qs[j] = (int8_t) std::min(127, v);
+        }
+        for (int j = 0; j < QK_K / 16; ++j) {
+            int s = 0;
+            for (int ii = 0; ii < 16; ++ii) s += y[i].qs[j * 16 + ii];
+            y[i].bsums[j] = (int16_t) s;
+        }
+        y[i].d = 1 / iscale;
+    }
+}
+
+void rc_q8k(const float* x, const void* dst, int64_t n) {
+    block_q8_K rep[16];
+    if (n / QK_K > 16) return;
+    const auto* g = static_cast<const block_q8_K*>(dst);
+    unsigned long long ok[RC_FORMS] = {};
+    for (int m = 0; m < 2; ++m) {
+        rep_q8k(x, rep, n, m == 0);
+        bool same = true;
+        for (int64_t i = 0; i < n / QK_K && same; ++i)
+            same = fbits(rep[i].d) == fbits(g[i].d) && std::memcmp(rep[i].qs, g[i].qs, QK_K) == 0 &&
+                   (g[i].d == 0 || std::memcmp(rep[i].bsums, g[i].bsums, sizeof(rep[i].bsums)) == 0);
+        ok[m] = same;
+    }
+    rc_add(RC_Q8K, ok, 1);
+}
+
+// arm/quants.c quantize_row_q8_0 (__ARM_NEON): d = amax/127, id = 1/d, round-to-nearest-even of x*id, d stored fp16
+void rc_q80(const float* x, const void* dst, int64_t n) {
+    const auto* g = static_cast<const block_q8_0*>(dst);
+    bool same = true;
+    for (int64_t i = 0; i < n / QK8_0 && same; ++i) {
+        const float* xb = x + i * QK8_0;
+        float amax = 0;
+        for (int j = 0; j < QK8_0; ++j) amax = std::max(amax, std::fabs(xb[j]));
+        const float d = amax / 127;
+        const float id = d ? 1.0f / d : 0.0f;
+        same = ggml_fp32_to_fp16(d) == g[i].d;
+        for (int j = 0; j < QK8_0 && same; ++j) same = (int8_t) (int) std::nearbyint(xb[j] * id) == g[i].qs[j];
+    }
+    const unsigned long long ok[RC_FORMS] = {same ? 1ull : 0ull, 0, 0};
+    rc_add(RC_Q80, ok, 1);
+}
+
+// glibc sysdeps/ieee754/flt-32/e_expf.c (ARM optimized-routines): 32-entry 2^(i/32) table, cubic in double, aarch64's
+// round/lround for k.  The table is rebuilt from quad-precision exp2l (aarch64 long double), rounded to double.
+float rep_expf(float x, bool fused) {
+    static const std::array<uint64_t, 32> tab = [] {
+        std::array<uint64_t, 32> t{};
+        for (int i = 0; i < 32; ++i) {
+            const double v = (double) std::exp2((long double) i / 32);
+            uint64_t b;
+            std::memcpy(&b, &v, 8);
+            t[(size_t) i] = b - ((uint64_t) i << 47);
+        }
+        return t;
+    }();
+    constexpr double N = 32, InvLn2N = 0x1.71547652b82fep+0 * N;
+    constexpr double C0 = 0x1.c6af84b912394p-5 / N / N / N, C1 = 0x1.ebfce50fac4f3p-3 / N / N, C2 = 0x1.62e42ff0c52d6p-1 / N;
+    if (std::isnan(x)) return x + x;
+    if (x > 0x1.62e42ep6f) return INFINITY;
+    if (x < -0x1.9fe368p6f) return 0.0f;
+    double z = InvLn2N * (double) x;
+    keep_rounded(z);
+    const double kd = std::round(z);
+    const uint64_t ki = (uint64_t) (int64_t) std::lround(z);
+    const double r = z - kd;
+    uint64_t t = tab[ki % 32];
+    t += ki << 47;
+    double s;
+    std::memcpy(&s, &t, 8);
+    double r2 = r * r, p, y;
+    keep_rounded(r2);
+    if (fused) {
+        p = std::fma(C0, r, C1);
+        y = std::fma(C2, r, 1.0);
+        y = std::fma(p, r2, y);
+    } else {
+        p = C0 * r;
+        keep_rounded(p);
+        p = p + C1;
+        y = C2 * r;
+        keep_rounded(y);
+        y = y + 1.0;
+        double q = p * r2;
+        keep_rounded(q);
+        y = q + y;
+    }
+    y = y * s;
+    keep_rounded(y);
+    return (float) y;
+}
+
+// arm/quants.c ggml_vec_dot_iq4_nl_q8_0 (__ARM_NEON): per block pair `sumf += A*B*C + D*E*F`, X = A*B, Y = D*E;
+// form 0 = sumf + fma(X, C, Y*F) (GCC contracting the first product into the sum), 1 = no contraction,
+// 2 = sumf + fma(Y, F, X*C).  n_ff is an even number of blocks here; an odd tail returns NaN (never equal).
+float rep_iq4nl(const uint8_t* row, const void* act, int n, int form) {
+    const auto* x = reinterpret_cast<const block_iq4_nl*>(row);
+    const auto* y = reinterpret_cast<const block_q8_0*>(act);
+    const int nb = n / QK4_NL;
+    if (nb % 2 != 0) return NAN;
+    float sumf = 0;
+    for (int ib = 0; ib + 1 < nb; ib += 2) {
+        int s[2];
+        for (int k = 0; k < 2; ++k) {
+            int acc = 0;
+            for (int j = 0; j < QK4_NL / 2; ++j)
+                acc += kvalues_iq4nl[x[ib + k].qs[j] & 0xf] * y[ib + k].qs[j] +
+                       kvalues_iq4nl[x[ib + k].qs[j] >> 4] * y[ib + k].qs[j + QK4_NL / 2];
+            s[k] = acc;
+        }
+        float X = ggml_fp16_to_fp32(x[ib].d) * ggml_fp16_to_fp32(y[ib].d);
+        float Y = ggml_fp16_to_fp32(x[ib + 1].d) * ggml_fp16_to_fp32(y[ib + 1].d);
+        keep_rounded(X);
+        keep_rounded(Y);
+        const float C = (float) s[0], F = (float) s[1];
+        float t;
+        if (form == 0) {
+            float yf = Y * F;
+            keep_rounded(yf);
+            t = std::fma(X, C, yf);
+        } else if (form == 1) {
+            float a = X * C, b = Y * F;
+            keep_rounded(a);
+            keep_rounded(b);
+            t = a + b;
+        } else {
+            float xc = X * C;
+            keep_rounded(xc);
+            t = std::fma(Y, F, xc);
+        }
+        keep_rounded(t);
+        sumf = sumf + t;
+    }
+    return sumf;
+}
 #endif
 
 }  // namespace
@@ -552,6 +760,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.d_act = (int) td->vec_dot_type;
 #ifdef STRATA_IQ3S_NEON_MT_BUILD
     if (gu_type == GGML_TYPE_IQ3_S) (void) iq3s_neon_mt_mode();   // its startup line, once
+    (void) replica_check();
 #endif
     const char* q8_1_probe = std::getenv("STRATA_NATIVE_CPU_Q8_1_DOT");
     if (q8_1_probe != nullptr && !q8_1_selector_known(q8_1_probe)) {
@@ -633,6 +842,9 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
 #endif
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+    if (f.gu_act == GGML_TYPE_Q8_K && replica_check()) rc_q8k(x, dst, f.n_embd);
+#endif
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
@@ -641,6 +853,9 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
 #endif
     traits(f.d_act)->from_float(h, dst, f.n_ff);
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+    if (f.d_act == GGML_TYPE_Q8_0 && replica_check()) rc_q80(h, dst, f.n_ff);
+#endif
 }
 
 int native_gu_mt_min(int gu_type) {
@@ -745,6 +960,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 #endif
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+    const bool rc = f.gu_type == GGML_TYPE_IQ3_S && f.gu_act == GGML_TYPE_Q8_K && replica_check();
+    unsigned long long rc_d[RC_FORMS] = {}, rc_e[RC_FORMS] = {}, rc_n = 0;
+#endif
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = ub + (size_t) r * f.gu_row;
@@ -753,8 +972,28 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+            if (rc) {
+                for (int m = 1; m <= 2; ++m) {
+                    float rg = 0.f, ru = 0.f;
+                    iq3s_dot_mt(gr, &act[t], 1, n, m, &rg);
+                    iq3s_dot_mt(ur, &act[t], 1, n, m, &ru);
+                    rc_d[m - 1] += (fbits(rg) == fbits(g)) + (fbits(ru) == fbits(u));
+                }
+                const uint32_t e = fbits(std::exp(-g));
+                rc_e[0] += fbits(rep_expf(-g, true)) == e;
+                rc_e[1] += fbits(rep_expf(-g, false)) == e;
+                ++rc_n;
+            }
+#endif
         }
     }
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+    if (rc_n != 0) {
+        rc_add(RC_EXP, rc_e, rc_n);
+        rc_add(RC_IQ3S, rc_d, 2 * rc_n);
+    }
+#endif
 }
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
@@ -791,14 +1030,27 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
 #endif
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+    const bool rc = f.d_type == GGML_TYPE_IQ4_NL && f.d_act == GGML_TYPE_Q8_0 && replica_check();
+    unsigned long long rc_d[RC_FORMS] = {}, rc_n = 0;
+#endif
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = db + (size_t) r * f.d_row;
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);
             out[t][r] = s;
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+            if (rc) {
+                for (int m = 0; m < 3; ++m) rc_d[m] += fbits(rep_iq4nl(dr, hq[t], n, m)) == fbits(s);
+                ++rc_n;
+            }
+#endif
         }
     }
+#ifdef STRATA_IQ3S_NEON_MT_BUILD
+    if (rc_n != 0) rc_add(RC_IQ4NL, rc_d, rc_n);
+#endif
 }
 
 }  // namespace strata::kernels::cpu
