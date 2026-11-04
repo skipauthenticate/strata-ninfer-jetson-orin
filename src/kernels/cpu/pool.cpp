@@ -243,12 +243,17 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
     std::vector<CoreLinux> all_cpus;
     std::vector<std::pair<long, long>> seen_phys;
     long max_cap = 0, min_cap = 1000000;
+    // STRATA_POOL_SIBLINGS=1: name a core by the first CPU of its thread_siblings_list (a sorted cpulist), not by
+    // (package, core_id).  A Jetson Orin repeats core_id 0-3 in each of its 3 clusters, so the default counts 4
+    // cores of 12 and pins every pool worker past the third nowhere.
+    const char* sib_env = std::getenv("STRATA_POOL_SIBLINGS");
+    const bool by_siblings = sib_env != nullptr && std::atoi(sib_env) == 1;
 
     for (int cpu : allowed) {
         CoreLinux cl;
         cl.cpu = cpu;
         cl.pkg = topo_read(cpu, "physical_package_id");
-        cl.core = topo_read(cpu, "core_id");
+        cl.core = topo_read(cpu, by_siblings ? "thread_siblings_list" : "core_id");
         cl.cap = cap_read(cpu);
         if (cl.cap > 0) {
             max_cap = (std::max)(max_cap, cl.cap);
