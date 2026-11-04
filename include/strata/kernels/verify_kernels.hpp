@@ -27,6 +27,13 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0, bool commit = false);
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
+/// STRATA_COMMIT_BATCH=1: gdn_conv_commit + gdn_step_norm_multi's state-only commit for n_layers consecutive GDN layers
+/// in two launches (layer i at state + i * state_stride, its conv history at + conv_off; qkv/h/gate/beta at
+/// i * their stride).  The same per-layer arithmetic, bitwise.  false (nothing launched) when the per-layer commit
+/// would take another kernel (STRATA_GDN_SPLIT=1, STRATA_GDN_COMMIT_SPLIT=0, STRATA_DBG_GDN=1) or the shapes do not fit.
+bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
+                       const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
+                       int conv_channels, int h_k, int h_v, int n_layers, const int32_t* n_keep, void* stream);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);

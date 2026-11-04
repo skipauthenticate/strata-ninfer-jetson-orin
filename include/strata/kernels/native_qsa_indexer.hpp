@@ -56,4 +56,20 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
 void native_qsa_indexer_restore_spare(const int32_t* commit, float* dead, float* pooled,
                                       const QsaShapes& shapes, int64_t max_cells, int max_tokens, void* stream);
 
+/// STRATA_COMMIT_BATCH=1: the verifier commit's QSA work for n_layers layers in one launch (one block per layer):
+/// tail <- tail_src (TS floats), then native_qsa_indexer_append_steps(raw0 + i * raw_stride, commit + 2, 1, max_tokens,
+/// pos_base 0, ...), then native_qsa_indexer_restore_spare(commit, ..., max_tokens): the per-layer calls' arithmetic.
+struct QsaIndexerLayers {
+    static constexpr int kMax = 16;
+    const float* gamma[kMax];
+    const float* tail_src[kMax];
+    float* tail[kMax];
+    float* dead[kMax];
+    float* pooled[kMax];
+    int32_t* block_pos[kMax];
+};
+void native_qsa_indexer_commit_layers(const float* raw0, int64_t raw_stride, const int32_t* commit, int max_tokens,
+                                      float epsilon, const QsaIndexerLayers& layers, int n_layers, const QsaShapes& s,
+                                      int64_t max_cells, const RopeScaling& scaling, void* stream);
+
 } // namespace strata::kernels

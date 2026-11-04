@@ -43,6 +43,15 @@ __device__ float warp_sum(float x) {
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
 template <bool TAB>
+__device__ __forceinline__ void append_body(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+                        int pos_stride, int n_steps,
+                        int pos_base, const float* __restrict__ gamma, float epsilon,
+                        float* __restrict__ tail, float* __restrict__ dead,
+                        float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                        int max_cells, float theta_scale, float freq_scale, float corr_low,
+                        float corr_high, float ext_factor, float mscale,
+                        const int32_t* __restrict__ mtab, const RopeTab& rt);
+template <bool TAB>
 __global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_stride, int n_steps,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
@@ -51,6 +60,38 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
                         int max_cells, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
                         const int32_t* __restrict__ mtab, RopeTab rt) {
+    append_body<TAB>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
+                     theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
+}
+__device__ __forceinline__ void restore_spare_body(const int32_t* __restrict__ commit, const float* __restrict__ dead,
+                                                   float* __restrict__ pooled, int max_cells, int max_tokens);
+// STRATA_COMMIT_BATCH=1 (upstream 6f3e38100, plus our spare restore): the commit's work for several QSA layers in one
+// launch, one block per layer (blockIdx.x), in the per-layer commit's order: the tail restored from the window's
+// snapshot (its copy_from_mapped), append's body, then restore_spare's body
+template <bool TAB>
+__global__ void commit_layers(const float* __restrict__ raw0, long long raw_stride, const int32_t* __restrict__ commit,
+                              int n_steps, float epsilon, QsaIndexerLayers L, int max_cells, float theta_scale,
+                              float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
+                              const int32_t* __restrict__ mtab, RopeTab rt) {
+    const int i = blockIdx.x;
+    float* tail = L.tail[i];
+    for (int j = threadIdx.x; j < (R - 1) * D; j += blockDim.x) tail[j] = L.tail_src[i][j];
+    __syncthreads();
+    append_body<TAB>(raw0 + (long long) i * raw_stride, commit + 2, 1, n_steps, 0, L.gamma[i], epsilon, tail, L.dead[i],
+                     L.pooled[i], L.block_pos[i], max_cells, theta_scale, freq_scale, corr_low, corr_high, ext_factor,
+                     mscale, mtab, rt);
+    __syncthreads();
+    restore_spare_body(commit, L.dead[i], L.pooled[i], max_cells, n_steps);
+}
+template <bool TAB>
+__device__ __forceinline__ void append_body(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+                        int pos_stride, int n_steps,
+                        int pos_base, const float* __restrict__ gamma, float epsilon,
+                        float* __restrict__ tail, float* __restrict__ dead,
+                        float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                        int max_cells, float theta_scale, float freq_scale, float corr_low,
+                        float corr_high, float ext_factor, float mscale,
+                        const int32_t* __restrict__ mtab, const RopeTab& rt) {
     __shared__ float values[D];
     __shared__ float partials[32];
     const int d = threadIdx.x;
@@ -226,6 +267,10 @@ __global__ void append_tail(const float* __restrict__ raw, int64_t n, int64_t p0
 // at the accepted sequence's current spare index.
 __global__ void restore_spare(const int32_t* __restrict__ commit, const float* __restrict__ dead,
                               float* __restrict__ pooled, int max_cells, int max_tokens) {
+    restore_spare_body(commit, dead, pooled, max_cells, max_tokens);
+}
+__device__ __forceinline__ void restore_spare_body(const int32_t* __restrict__ commit, const float* __restrict__ dead,
+                                                   float* __restrict__ pooled, int max_cells, int max_tokens) {
     const int d = threadIdx.x;
     const int keep = commit[0];
     if (d >= D || keep < 1 || keep > max_tokens) return;
@@ -331,6 +376,30 @@ void native_qsa_indexer_restore_spare(const int32_t* commit, float* dead, float*
     validate({pooled, size_t(max_cells / R + 1) * D * sizeof(float)});
     restore_spare<<<1, THREADS, 0, static_cast<cudaStream_t>(stream)>>>(commit, dead, pooled,
                                                                         (int) max_cells, max_tokens);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void native_qsa_indexer_commit_layers(const float* raw0, int64_t raw_stride, const int32_t* commit, int max_tokens,
+                                      float epsilon, const QsaIndexerLayers& layers, int n_layers, const QsaShapes& s,
+                                      int64_t max_cells, const RopeScaling& scaling, void* stream) {
+    if (n_layers <= 0) return;
+    if (!stream || !commit || n_layers > QsaIndexerLayers::kMax || max_tokens < 1 || s.idx_dim != D ||
+        s.idx_block != R || s.n_rot != ROT || max_cells < 1 || max_cells > INT32_MAX || !std::isfinite(epsilon) ||
+        epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer (commit layers): bad geometry, capacity, parameters or scaling");
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
+    const RopeTab rt = rope_table_for(scaling);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (rt.cos != nullptr)
+        commit_layers<true><<<(unsigned) n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, commit, max_tokens,
+            epsilon, layers, (int) max_cells, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+            k.attn_factor, mrope_table(), rt);
+    else
+        commit_layers<false><<<(unsigned) n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, commit, max_tokens,
+            epsilon, layers, (int) max_cells, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+            k.attn_factor, mrope_table(), rt);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
