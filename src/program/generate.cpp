@@ -8678,6 +8678,37 @@ int main(int argc, char** argv) {
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        // ar STRATA_SPEC_COST=1 (opt-in, port of upstream 687810556): the serial loop's MTP window by expected tokens
+        // per ms at the measured round costs (DraftPolicy::keep_draft after each draft step) instead of the --spec-min-p /
+        // STRATA_SPEC_CUM test (it needs --spec-min-p > 0: draft()'s stepwise path). STRATA_SPEC_COST_TABLE="T1,T2,.."
+        // seeds the round ms of windows of 1, 2, .. rows (worth 6 rounds each).
+        // Window choice only: the verify window decides every token, so the text is unchanged.
+        static const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();
+        strata::spec::DraftPolicy::ChainState chain_st;
+        int chain_rows = 0;   // the window keep_draft chose in the chain just drafted (0: the chain did not ask the rule)
+        std::array<float, strata::spec::DraftPolicy::kMaxT> dwin{};   // the drafts' probabilities the window was chosen from
+        struct ChainRuleOff { strata::core::MtpDrafter& m; ~ChainRuleOff() { m.set_chain_rule(nullptr); } } chain_rule_off{mtp};
+        if (spec_cost && use_mtp) {
+            if (const char* tab = std::getenv("STRATA_SPEC_COST_TABLE"); tab != nullptr && tab[0] != '\0') {
+                double ms[strata::spec::DraftPolicy::kMaxT] = {};
+                int n = 0;
+                for (const char* q = tab; *q != '\0' && n < strata::spec::DraftPolicy::kMaxT;) {
+                    ms[n++] = std::atof(q);
+                    while (*q != '\0' && *q != ',') ++q;
+                    if (*q == ',') ++q;
+                }
+                policy.seed_costs(ms, n, 6.0);
+            }
+            policy.set_robust(true);
+            mtp.set_chain_rule([&policy, &chain_st, &chain_rows, S_mtp](int idx, float pj) {
+                const bool more = policy.keep_draft(chain_st, idx, pj, S_mtp);
+                chain_rows = chain_st.best_rows;
+                return more;
+            });
+            std::fprintf(stderr, "strata serve: STRATA_SPEC_COST=1: MTP windows of up to %d rows by expected tokens per ms "
+                                 "(costs %.1f %.1f %.1f %.1f ms at 1-4 rows before any round)\n", S_mtp,
+                         policy.cost_ms(1), policy.cost_ms(2), policy.cost_ms(3), policy.cost_ms(4));
+        }
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -11434,13 +11465,17 @@ int main(int argc, char** argv) {
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
                     float cum = 1.0f;   // STRATA_SPEC_CUM (opt-in): the drafts' joint probability gates them too
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p &&
-                           strata::core::MtpDrafter::cum_ok(T - 1, cum * dprob[(size_t) T - 1])) {
-                        cum *= dprob[(size_t) T - 1];
-                        ++T;
-                    }
+                    if (chain_rows > 0) T = std::min(chain_rows, S_mtp);   // STRATA_SPEC_COST: keep_draft's window
+                    else
+                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p &&
+                               strata::core::MtpDrafter::cum_ok(T - 1, cum * dprob[(size_t) T - 1])) {
+                            cum *= dprob[(size_t) T - 1];
+                            ++T;
+                        }
                 }
                 if (first_window) T = 1;
+                const int T_chosen = T;   // STRATA_SPEC_COST: an MTP window of these drafts teaches observe_probs
+                for (int j = 0; j + 1 < T && j < (int) dwin.size(); ++j) dwin[(size_t) j] = dprob[(size_t) j];
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
@@ -11650,6 +11685,7 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                chain_rows = 0;   // STRATA_SPEC_COST: set by the chain rule inside draft()
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
@@ -11682,6 +11718,8 @@ int main(int argc, char** argv) {
                 else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
                     policy.observe_chain(T_mtp, chain_n, a, cm,
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                if (spec_cost && use_mtp && timed_round && !eos && !from_sfx && chain_n == 0 && T == T_chosen && T > 1)
+                    policy.observe_probs(dwin.data(), T - 1, a);
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];

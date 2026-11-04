@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,9 @@ public:
     /// ar opt-in STRATA_SPEC_CUM="t0,t1,..": besides --spec-min-p, draft j joins the window only while the product of
     /// drafts 0..j's probabilities `cum` is >= t_j (the last value repeats); unset = always true. Drafting policy only.
     static bool cum_ok(int j, float cum);
+    /// ar STRATA_SPEC_COST=1: draft()'s chain (its min_p > 0 path) asks rule(j, p_j) after draft j whether to compute
+    /// draft j + 1, instead of the min_p / cum_ok test. Empty = that test. Drafting policy only.
+    void set_chain_rule(std::function<bool(int, float)> rule) { chain_rule_ = std::move(rule); }
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
@@ -210,6 +214,7 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
+    std::function<bool(int, float)> chain_rule_;   // set_chain_rule
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors

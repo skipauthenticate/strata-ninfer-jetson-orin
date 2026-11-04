@@ -12,6 +12,7 @@ namespace {
 constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6};
 constexpr double kCostAlpha = 0.1;    // EMA weight of a new round time
 constexpr double kTokAlpha = 0.05;    // EMA weight of a new MTP window outcome
+constexpr double kCalDecay = 0.995;   // STRATA_SPEC_COST: the MTP probability -> acceptance table fades slowly
 constexpr double kDecay = 0.97;       // lookup counts: older windows fade
 // Before a bucket has data: the longer the match, the likelier its continuation (llama.cpp's lookup decoding gates
 // on the same thing); worth 4 observations, so a few real windows override it
@@ -88,13 +89,82 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     return p;
 }
 
+void DraftPolicy::add_cost(int t, double ms) {
+    double alpha = kCostAlpha;
+    if (robust_) {
+        if (cost_n_[t] == 0) {
+            // a width's first round captures its graph: the guess from the measured widths stands in, if there is one
+            for (int u = 1; u <= kMaxT; ++u)
+                if (cost_n_[u] > 0) { ms = cost_ms(t); break; }
+        } else {
+            ms = std::min(ms, 2.0 * cost_[t]);
+        }
+        alpha = std::max(kCostAlpha, 1.0 / (cost_n_[t] + 1.0));
+    }
+    cost_[t] = cost_n_[t] > 0 ? (1.0 - alpha) * cost_[t] + alpha * ms : ms;
+    cost_n_[t] += 1.0;
+    last_[t] = rounds_;
+}
+
+void DraftPolicy::seed_costs(const double* ms, int n, double weight) {
+    for (int t = 1; t <= std::min(n, kMaxT); ++t)
+        if (ms[t - 1] > 0.0 && cost_n_[t] == 0) {
+            cost_[t] = ms[t - 1];
+            cost_n_[t] = weight;
+        }
+}
+
+namespace {
+int p_bucket(double p) {
+    const int b = (int) (p * 8.0);
+    return b < 0 ? 0 : b > 7 ? 7 : b;
+}
+}  // namespace
+
+// Until a bucket has data a draft is as likely to hold as the MTP says (worth kPriorN observations)
+double DraftPolicy::draft_rate(double p) const {
+    const int b = p_bucket(p);
+    return (pa_ok_[b] + kPriorN * std::clamp(p, 0.0, 1.0)) / (pa_n_[b] + kPriorN);
+}
+
+void DraftPolicy::observe_probs(const float* p, int n, int accepted) {
+    // draft j was reached when the drafts before it held; it held when j < accepted
+    for (int j = 0; j < n && j <= accepted; ++j) {
+        const int b = p_bucket(p[j]);
+        pa_ok_[b] = kCalDecay * pa_ok_[b] + (j < accepted ? 1.0 : 0.0);
+        pa_n_[b] = kCalDecay * pa_n_[b] + 1.0;
+    }
+}
+
+bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
+    cap = std::clamp(cap, 1, max_t_);
+    if (idx == 0) {
+        st = ChainState{};
+        st.best_v = 1.0 / cost_ms(1);
+    }
+    const double a = draft_rate(p);
+    st.q *= a;
+    st.e += st.q;
+    const int rows = idx + 2;
+    if (rows <= cap) {
+        const double v = st.e / cost_ms(rows);
+        if (v > st.best_v * (1.0 + margin_ / 3.0)) {
+            st.best_v = v;
+            st.best_rows = rows;
+        }
+        // a width not measured yet is tried a few times when the chain is likely to hold that far
+        if (cost_n_[rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
+    }
+    if (rows + 1 > cap) return false;   // no row left for another draft
+    // one or two more drafts, each as likely to hold as this one, could they beat the best width so far?
+    const double v1 = (st.e + st.q * a) / cost_ms(rows + 1);
+    const double v2 = rows + 2 <= cap ? (st.e + st.q * a + st.q * a * a) / cost_ms(rows + 2) : 0.0;
+    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[rows + 1] < kProbes && st.q * a >= 0.15);
+}
+
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
-    if (round_ms > 0) {
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
-        cost_n_[t] += 1.0;
-        last_[t] = rounds_;
-    }
+    if (round_ms > 0) add_cost(t, round_ms);
     rounds_ += 1.0;
     if (lookup) {
         const int b = bucket(match);
@@ -137,11 +207,7 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
 
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
-    if (round_ms > 0) {
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
-        cost_n_[t] += 1.0;
-        last_[t] = rounds_;
-    }
+    if (round_ms > 0) add_cost(t, round_ms);
     rounds_ += 1.0;
     // the MTP part is an ordinary MTP window as far as its own drafts go
     const int mtp_acc = std::min(accepted, t_mtp - 1);

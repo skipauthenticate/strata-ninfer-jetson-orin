@@ -1581,7 +1581,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         float cum = pj;   // STRATA_SPEC_CUM: draft j is needed only if draft j - 1 joins the window
         // ... and only if draft j can still join: its joint probability is cum * p_j <= cum, so cum below draft j's
         // threshold means the step's draft would be cut anyway (same windows, one draft step less)
-        for (int j = 1; j < max_steps && pj >= min_p && cum_ok(j - 1, cum) && cum_ok(j, cum); ++j) {
+        bool more = chain_rule_ ? chain_rule_(0, pj) : true;   // ar STRATA_SPEC_COST: the rule instead of the test
+        for (int j = 1; j < max_steps && (chain_rule_ ? more : pj >= min_p && cum_ok(j - 1, cum) && cum_ok(j, cum)); ++j) {
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
@@ -1594,6 +1595,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             if (probs) probs[j] = pj;
             cum *= pj;
             ++n;
+            if (chain_rule_) more = chain_rule_(j, pj);
         }
         prefetch_ple(drafts[n - 1]);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {

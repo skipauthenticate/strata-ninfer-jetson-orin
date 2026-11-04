@@ -46,10 +46,36 @@ public:
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
 
+    /// ar STRATA_SPEC_COST=1 (opt-in; port of upstream 687810556 / 5f49ec459): the cost-aware MTP window. The chain is
+    /// drafted one step at a time; after draft j (probability p_j)
+    ///   E_j = 1 + q_0 + .. + q_j,  q_i = prod_{k<=i} a(p_k),  a() = the acceptance measured for MTP drafts of that probability
+    /// is the expected tokens of the window of j + 2 rows, worth E_j / cost_ms(j + 2) tokens per ms. The window is the best
+    /// width so far; the chain goes on only while one or two more drafts could still beat it. Window choice only: the
+    /// verify window decides every token, so the output is unchanged.
+    struct ChainState {
+        double q = 1.0, e = 1.0, best_v = 0.0;
+        int best_rows = 1;                 ///< the window to verify: 1 + the drafts kept
+    };
+    /// Draft `idx` (0-based, probability p) was just computed: update `st`, say whether to compute draft idx + 1.
+    /// idx == 0 starts a new chain. `cap` = the widest window (rows).
+    bool keep_draft(ChainState& st, int idx, float p, int cap) const;
+    /// After an MTP window whose drafts came with p[0..n): `accepted` of them held. Teaches draft_rate().
+    void observe_probs(const float* p, int n, int accepted);
+    double draft_rate(double p) const;     // measured acceptance of an MTP draft that came with probability p
+    /// Round ms of windows of 1..n rows, counted as `weight` rounds each (STRATA_SPEC_COST_TABLE); measurements replace it.
+    void seed_costs(const double* ms, int n, double weight);
+    /// Robust costs (STRATA_SPEC_COST): a round far above the known cost of its width (a graph capture, a stall) counts
+    /// as at most twice that cost, and the first samples are a running mean. Off: the cost EMA as it always was.
+    void set_robust(bool on) { robust_ = on; }
+
 private:
     static int bucket(int match);
     double mtp_tokens(int t) const;
     bool stale(int t) const;               // a size not measured for a long stretch of rounds
+    void add_cost(int t, double ms);       // one round time into the cost EMA of its width
+    static constexpr int kPBuckets = 8;
+    std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts accepted / reached by probability bucket (decayed)
+    bool robust_ = false;
 
     int max_t_;
     double margin_;
