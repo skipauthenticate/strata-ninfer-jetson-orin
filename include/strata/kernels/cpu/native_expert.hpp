@@ -54,7 +54,8 @@ int native_gu_mt_min(int gu_type);
 /// `up`: the up rows when they are not at blob + f.up_off (STRATA_MISS_ZEROCOPY; the x86 multi-token kernels then step aside).
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1, const uint8_t* up = nullptr);
-/// out[t][r] = down_r . hq[t] for rows r in [r0, r1).  `down`: the down rows when they are not at blob + f.down_off.
+/// out[t][r] = down_r . hq[t] for rows r in [r0, r1).  `down`: the down rows when they are not at blob + f.down_off
+/// (same STRATA_MISS_ZEROCOPY rule as `up`).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1, const uint8_t* down = nullptr);
 

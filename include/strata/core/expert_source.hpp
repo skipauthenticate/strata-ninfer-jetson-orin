@@ -200,7 +200,8 @@ public:
     /// STRATA_MISS_OVERLAP: whether `blob` would find this expert's bytes in RAM now (no drive read); true by default.
     virtual bool pages_cached(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return true; }
     /// STRATA_MISS_ZEROCOPY: role `r`'s rows (0 gate, 1 up, 2 down) of the expert where they lie for good (the GGUF
-    /// mapping), when `blob` would assemble them from there; null otherwise (use `blob`).
+    /// mapping), when `blob` would assemble them from there; null otherwise (use `blob`).  A new virtual: every TU that
+    /// includes this header must be rebuilt with it (r3-p010..e032 ran a stale mix and crashed at the first decode).
     virtual const uint8_t* slice(int64_t layer, int64_t expert, int r) const { (void) layer; (void) expert; (void) r; return nullptr; }
     /// CS-T: the experts of `layer` a predictor expects next - a source that reads a file may start reading their
     /// pages now, in the background.  Only warms: what `blob` returns is unchanged.  Default: nothing.

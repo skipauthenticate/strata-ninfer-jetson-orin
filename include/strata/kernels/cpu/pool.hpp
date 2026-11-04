@@ -63,7 +63,7 @@ struct ExpertJobMulti {
     /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
     /// STRATA_MISS_ZEROCOPY (native packs, the GGUF in place): the up and down rows' own slices; null = blob + up_off /
-    /// blob + down_off (an assembled blob).  The same bytes either way.
+    /// blob + down_off (an assembled blob).  The same bytes either way.  (Changes the struct's size: rebuild every user.)
     const uint8_t* up = nullptr;
     const uint8_t* down = nullptr;
 };
