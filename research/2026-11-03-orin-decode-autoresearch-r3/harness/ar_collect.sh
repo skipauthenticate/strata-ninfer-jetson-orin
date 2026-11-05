@@ -3,6 +3,8 @@
 # usage: ./ar_collect.sh
 set -u
 cd "$(dirname "$0")"
+# one collect at a time (orchestrator, 16:30 PST): two at once both logged r3-e095, a duplicate results row
+[ -z "${AR_COLLECT_LOCKED:-}" ] && AR_COLLECT_LOCKED=1 exec lockf -k -t 900 logs/.collect.lock "$0" "$@"
 J=jetson; SRC=$HOME/workspace/strata-ar
 . ./jrun.sh
 collect_orphans

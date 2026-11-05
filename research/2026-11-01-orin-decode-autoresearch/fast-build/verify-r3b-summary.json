@@ -1,0 +1,61 @@
+{
+ "exp": "2026-11-04-fast-r3b-verify",
+ "status": "ok",
+ "exe_sha256": "8964f91308b15999",
+ "supervisor": "pass",
+ "min_avail_gib": 11.89,
+ "decode_med": 36.74,
+ "decode_min": 34.33,
+ "decode_max": 37.08,
+ "decode_runs": [
+  34.33,
+  37.08,
+  36.74
+ ],
+ "prefill_med": 343.7,
+ "ttft_med": 11.98,
+ "generated": [
+  256,
+  256,
+  256
+ ],
+ "workloads": {
+  "prose": {
+   "decode_med": 26.32,
+   "decode_runs": [
+    27.64,
+    25.62,
+    26.32
+   ],
+   "generated": [
+    256,
+    256,
+    256
+   ]
+  },
+  "repetition": {
+   "decode_med": 32.69,
+   "decode_runs": [
+    32.41,
+    32.69,
+    33.17
+   ],
+   "generated": [
+    256,
+    256,
+    256
+   ]
+  }
+ },
+ "prose_med": 26.32,
+ "rep_med": 32.69,
+ "pr_mean": 29.5,
+ "hit_rate_last": 99.9,
+ "hit_review": 99.9,
+ "hit_prose": 87.0,
+ "hit_rep": 78.9,
+ "cache_slots": 19068,
+ "needles": "3/3",
+ "note": "run-iq3_s.sh -> strata-iq3_s-fast-r3b.json; review = community benchmark, then prose and repetition in the same server session; texts identical to r3-baseline-f1/f2 on all nine prompts (compare.py agreement_min 1.0)",
+ "started": "MemAvailable at start: 52210 MiB"
+}

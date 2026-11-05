@@ -4,7 +4,9 @@ A third unattended loop, two days after [round 2](../2026-11-01-orin-decode-auto
 (JetPack 7, CUDA 13.2), same model, same rules: lossless only, a fixed 262,144-token context, and a change is kept
 only if the output text stays identical. New in this round: **three workloads** on every run instead of one, a
 queue on the board so builds and measurements run without the laptop, and a literature pass over other engines
-before the loop started.
+before the loop started. The loop was resumed for 4.5 hours on 2026-11-04 to win back time lost to a usage limit;
+that [continuation](#continuation-2026-11-04-1355-1825-pst) moved the miss pool onto 9 of the Orin's 12 cores and
+is the installed configuration now.
 
 ## Result
 
@@ -20,13 +22,20 @@ with 256 greedy tokens each, through `serve/server.py`. Every run measures three
 | **Best: `STRATA_SPEC_COST` + zero-copy misses + 7 CPU workers** (`r3-e047`) | **36.82** | **25.92** | **30.78** | identical |
 | Same settings at the final head (`r3-e076`, `r3-e077` with 32K needles 3/3) | 36.84 / 37.02 | 25.67 / 25.90 | 30.87 / 31.37 | identical |
 | Wide windows: + `STRATA_IL_SPLIT`, spec 8 (`r3-e062`, `r3-e078`, `r3-e079` with needles 3/3) | 36.21 / 36.58 / 36.80 | 25.23 / 24.75 / 23.80 | 32.61 / 32.35 / 33.19 | identical |
-| **Installed start script, verified 2026-11-04 02:15 PST** (`run-iq3_s.sh`, needles 3/3) | **36.98** | **25.72** | **31.12** | identical |
+| Installed start script, verified 2026-11-04 02:15 PST (`run-iq3_s.sh`, needles 3/3) | 36.98 | 25.72 | 31.12 | identical |
+| Continuation's final head, every switch off (`r3-e115`) | 35.52 | 18.35 | 16.09 | identical |
+| Same head, the 02:15 install's settings (`r3-e116` / `e119`) | 36.54 / 37.02 | 25.92 / 25.79 | 30.76 / 30.79 | identical |
+| + 9 pinned miss workers, `STRATA_POOL_SIBLINGS=1` (`r3-e117`, `r3-e118` with needles 3/3) | 36.83 / 36.95 | 26.69 / 26.84 | 32.39 / 32.87 | identical |
+| Wide windows + 9 pinned workers (`r3-e120`; `r3-e090` / `e098` in the loop) | 37.10 | 26.23 | 35.60 | identical |
+| **Installed start script, verified 2026-11-04 22:01 PST** (`fast-r3b`, needles 3/3) | **36.74** | **26.32** | **32.69** | identical |
 
-Through the installed start script, against the baselines' mean: review **+4.1%**, prose **+39%**, repetition
-**+88%**, with text identical to the baselines on all nine prompts, 32K needles 3/3, the same 19,068 cache slots,
-prompt speed 333.6 tok/s, TTFT 12.3 s and a minimum of 11.96 GiB free memory. The engine is this branch's head
-(sha256 `69995077...`, the same binary as `r3-e075`-`e079`). The wide-window settings are ~5% faster on repetition,
-~1% slower on review and ~5% slower on prose (means of three runs each); they were not installed.
+Through the start script installed at 22:01 PST, against the baselines' mean: review **+3.4%**, prose **+42%**,
+repetition **+98%**, with text identical to the baselines on all nine prompts, 32K needles 3/3, the same 19,068
+cache slots, prompt speed 343.7 tok/s, TTFT 12.0 s and a minimum of 11.89 GiB free memory. The engine is this
+branch's head (sha256 `8964f913...`, the same binary as `r3-e115`-`e120`). Against the 02:15 install over every run
+of each configuration, the 9 pinned workers are -0.4% on review (36.71 vs 36.87, inside the spread), +2.9% on prose
+(26.56 vs 25.82) and +5.2% on repetition (32.57 vs 30.95). The wide-window settings with 9 pinned workers average
++13% on repetition (35.07) but vary more on review and prose (35.64-37.10, 23.88-26.23); they were not installed.
 
 The 87.5 tok/s goal on review was not reached. The literature pass put the realistic landing for this engine on
 general text at ~45-48 tok/s; this round reached 37.0.
@@ -58,9 +67,10 @@ All new behavior is opt-in; with none of these switches set the engine is unchan
   cold reads exist), `STRATA_GU_SWIGLU` (fused gate/up + SwiGLU + quantize; window hashes bitwise), and
   `STRATA_COMMIT_BATCH` (the verifier commit's GDN and QSA work batched across layers).
 
-The best settings are `overrides/r3-e047-scost-zcp7.json` on top of `base-overrides.json` (round 2's best). To
-install them, follow [round 1's fast-build guide](../2026-11-01-orin-decode-autoresearch/fast-build/README.md),
-which now writes round 3's settings too.
+The best settings are `overrides/r3-e118-sibp9-needles.json` on top of `base-overrides.json` (round 2's best): the
+continuation's 9 pinned workers on top of `overrides/r3-e047-scost-zcp7.json`. To install them, follow
+[round 1's fast-build guide](../2026-11-01-orin-decode-autoresearch/fast-build/README.md), which now writes round 3's
+settings too.
 
 ## Why each workload sits where it does
 
@@ -74,12 +84,34 @@ which now writes round 3's settings too.
   miss path (`r3-e001`).
   Each 0.1% of hit rate is worth ~3% of decode on review.
 
-## Open lead: the miss pool uses 3 of 12 cores
+## Continuation, 2026-11-04 13:55-18:25 PST
 
-Every engine log of the round says `N pool workers on logical processors 1,2,3, the host thread on 0`, for N = 3,
-7 and 11. So `--pool-workers 7` gained by running 7 threads on 3 cores (they block on page-cache reads), and 8 of
-the Orin's 12 cores never touch the miss path. Spreading the pool over all 12 cores is untested; prose and
-repetition spend most of their remaining miss time there.
+The loop was restarted from the 02:15 install (12 iterations; it stopped on its deadline after a usage limit at
+18:00). All changes are opt-in; with every switch off the head reproduces the baselines (`r3-e115`).
+
+- **The miss pool on 9 of 12 cores, `STRATA_POOL_SIBLINGS=1`** (the install). Every CPU of the Orin reports
+  `physical_package_id` 0 and `core_id` 0-3 inside each of its 3 clusters, with no SMT. The pool named cores by
+  (package, core_id), counted 4, and pinned workers to CPUs 1-3 only (`N pool workers on logical processors 1,2,3`
+  at any N; workers past the third were not pinned). Naming a core by its `thread_siblings_list` gives 12. Pinned
+  to CPUs 1-9: prose +3%, repetition +5%, review unchanged. Pinned to 1-7 or 1-11 was slower on all three (7:
+  36.10 / 22.55 / 28.47; 11: 35.00 / 20.75 / 24.78; with 11, no core is left for the host, I/O and CUDA threads).
+- **Exact-rounding GPU misses, `STRATA_MISS_GPU_EXACT=1`**: texts identical, no gain. A diagnostic
+  (`STRATA_MISS_REPLICA_CHECK=1`, `r3-e095`) found the float forms ggml-cpu uses on this board (fused Q8_K
+  quantization; a fused multiply-add per IQ3_S block; `fma(X, C, Y*F)` for IQ4_NL) and GPU kernels in those forms
+  reproduce the CPU's misses bit for bit (`r3-e114`, texts identical on all nine). The GPU can only reach misses held
+  in a pinned RAM copy, and every copy of 2.5 GiB or more broke the bench's 6 GiB free-memory floor beside the
+  19,068-slot cache (12 runs); 1.5 GiB covered too few misses to gain (35.48 / 25.06 / 29.69 with timing on).
+- Measured, texts identical, no gain (kept opt-in): `STRATA_SPEC_STALE` (re-price stale window widths),
+  `STRATA_COPY_MATCH` (skip the MTP chain when a lookup copy fills the window; it took the copy on every such window
+  but the chain is short), `STRATA_MTP_PRIORITY=2` (drafter streams at the highest priority), `--pool-tasks`
+  64 / 128, and `STRATA_IQ3S_NEON_MT=1` (decode each IQ3_S block once for all window tokens on the CPU: 47-58 vs
+  40-45 ms of CPU time per repetition window). Its mode 2 (multiply, then add) changed the text: one float step is
+  enough for the gate to catch.
+- Dropped, never validly measured: a RAM copy ranked by another profile (all its runs hit the memory floor) and an
+  IQ4_NL NEON kernel (never queued).
+- Read from the logs: review's stalled requests are PLE table reads from the SSD (the 28.8 GB table cannot stay in
+  RAM; 6 of 99 timed requests). Review's one lever above ~1.5% left at `--spec 4` is the dense layers at one column
+  (~137 of ~180 GB/s, ~4-5 ms a window), which needs a weight re-layout that keeps results bit-identical.
 
 ## What did not count
 
@@ -117,7 +149,11 @@ batching.
   kept the laptop's file times, so ninja skipped changed files) and are marked so in `notes.md`. The queue now copies
   with `--checksum` and every result records the binary's sha256.
 - **The loop stopped early** at 00:03 PST (a usage limit, four failed iterations), 3.5 hours before its deadline;
-  three committed experiments were never measured and were dropped from the branch.
+  three committed experiments were never measured and were dropped from the branch. The continuation re-measured
+  them (no gain).
+- **The board was shared during the continuation** with another project's GPU jobs. A shared lock serializes GPU
+  work, so runs waited but did not overlap; `r3-e094`'s review median (30.47) is one stalled request with no other
+  job running.
 - **Not upstream-ready**: measured on the Orin only.
 
 ## Files
@@ -131,4 +167,5 @@ batching.
   home). New in this round: the board's queue runner (`harness/jetson/qrunner.sh`) that builds and measures queued
   snapshots in order, the three-workload bench, and the text gate over nine prompts (`harness/compare.py`).
   `harness/jetson/benchmark.py` adds gufo's two workloads to the community benchmark; the word pool, text
-  generator and task suffixes come from gufo (MIT, `harness/jetson/LICENSE-gufo.txt`).
+  generator and task suffixes come from gufo (MIT, `harness/jetson/LICENSE-gufo.txt`). `harness/ar_collect.sh`
+  takes a lock since the continuation (two collects at once had logged one run twice).

@@ -1,0 +1,1 @@
+{"args": {"--expert-profile": "/home/<user>/strata/Strata-data/profiles/iq3_s-warm.bin", "--pool-workers": "9"}, "env": {"STRATA_SPEC_COST": "1", "STRATA_SPEC_COST_TABLE": "52.5,63.5,74.5,86.7", "STRATA_MISS_ZEROCOPY": "1", "STRATA_POOL_SIBLINGS": "1", "STRATA_DECODE_TIMING": "1"}}

@@ -6,6 +6,9 @@ PENDING), `PLAN.md` and `research/plan-review.md` (the ranked plan and its corre
 `results.tsv`, and the research reports in `research/` as needed (gufo.md, upstream-strata.md, engines-and-papers.md).
 Round 2's log is `~/workspace/strata-ar-lab-r2/notes.md`. **First command of every iteration:
 `./ar_collect.sh`** (it logs runs that finished while no agent was watching). Then do one item, record it, stop.
+**Continuation (2026-11-04 14:00 PST):** the round was wrapped up and the best settings installed; the loop then
+resumed. Read notes.md's CONTINUATION block first: it gives the starting override (r3-e076's), the current best per
+workload, the rule-4 bar, the ranked items, and the next ids (r3-e080, r3-p016).
 
 ## Goal
 Raise single-request **decode tok/s** of Qwen3.8-Flash-Next **IQ3_S at a 262,144-token context**. Every bench measures

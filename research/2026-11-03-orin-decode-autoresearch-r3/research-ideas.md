@@ -169,3 +169,178 @@
 - Expected <= ~1.5-2% on review (attention is 2.7 of ~81 ms at T4), more at longer contexts only if the selection
   width grows (it does not past ~2K cells: width is capped), so this stays a ~2% item. Below B7/B10-class
   scheduling items in value per effort.
+
+## B12: multi-token NEON kernels for the CPU miss experts (iteration C3; gate/up built as 9135446b, runs e092-e094)
+- On the Orin the miss pool runs ggml-cpu's one-token `vec_dot` per (row, token) (`native_gu_rows` /
+  `native_down_rows` fallbacks in native_expert.cpp; the x86 builds have multi-token kernels). Expert groups hold
+  1.37 (prose) to 1.73 (repetition) tokens on average, and the CPU part is 27-37 ms of a ~100 ms prose/repetition
+  window, so decoding each block once per group is the prose/repetition lever that keeps texts identical.
+- Gate/up IQ3_S (`STRATA_IQ3S_NEON_MT`, 9135446b): ggml's NEON body with the token loop inside; the only float step
+  is `sumf += d*(sumi1 + sumi2)` a 256-block (mode 1 fma, mode 2 mul+add; e092/e093 decide).
+- **Down IQ4_NL, if the gate/up kernel pays** (`ggml_vec_dot_iq4_nl_q8_0`, llama.cpp ggml-cpu/arch/arm/quants.c:
+  4199-4257; n_ff 640 = 20 blocks, even, so the scalar tail never runs): per block pair the decode is 2 `vqtbl1q_s8`
+  of `kvalues_iq4nl` + and/shift (cheap: expect a smaller gain than gate/up), then per token 2 x 2 `vdotq_s32` and
+  `sumf += FP16(x0.d)*FP16(y0.d)*vaddvq(prod_1) + FP16(x1.d)*FP16(y1.d)*vaddvq(prod_2)`. Contraction choices for
+  that line under GCC -ffp-contract=fast (statement order X=A*B, t1=X*C, Y=D*E, t2=Y*F, t3=t1+t2, sumf+t3): most
+  likely `sumf + fma(X, C, Y*F)`; also try `sumf + (X*C + Y*F)` (no contraction) and `sumf + fma(Y, F, X*C)`. Each
+  as a mode of one switch, one build, the gate picks. Q8_0 activations: `block_q8_0` (fp16 d + 32 int8).
+  Size (instruction count, not measured): a 64-weight pair decodes in ~10 ops vs ~18 a token for loads, 4 sdot,
+  2 addv and the float line, so nt=2 saves ~18% of down time; over the group mix ~10% of down, ~1% of a repetition
+  window. Low priority: do it only if e092/e093 show the CPU part still dominates after the gate/up kernel.
+- LM head (for the review side, measured r3-e038 profile): native Q5_K head 521 MB, T1 3.43 ms (~152 GB/s, at the
+  streaming rate), T2 3.75, T3 4.54, **T4 4.78**, T6 11.27 ms. So <= ~1.3 ms a T4 window (~1.6% review) of room in
+  the head's column slope: a B1-class item, not a quick one.
+
+## B13: CPU misses computed by the GPU with the CPU's exact rounding (iteration C4; feasibility probe r3-e095)
+- Today a GPU-computed miss rounds like the GPU kernels (q8_1 activations, dp4a, warp sums), not like ggml-cpu
+  (Q8_K / Q8_0 activations, per-block float accumulate in block order), so moving misses to the GPU changes texts
+  (REVIEW class: A6, the cache-size runs, the PCIe share). Another project on the board measured ~180 GB/s GPU reads from
+  cudaHostRegister'ed / cudaHostAlloc-mapped memory on this board, so the GPU could read miss blobs in place.
+- Idea: GPU kernels that are bit-for-bit ggml-cpu's arithmetic: quantize x to Q8_K exactly as quantize_row_q8_K_ref
+  (amax with first-max tie rule, iscale = -127/max, magic-bias nearest int, bsums); per row and block the integer
+  sums (exact in any order), then the float steps in ggml's order with explicit `__fmaf_rn` / `__fmul_rn` +
+  `__fadd_rn` (no contraction freedom); SiLU with a port of glibc's expf (double arithmetic, the 32-entry table,
+  explicit fma or not); Q8_0 of h as arm quantize_row_q8_0 (`__fdiv_rn`, `__float2int_rn`, `__float2half_rn`); the
+  IQ4_NL pair line in the right form. The rows land in h_ymiss_ exactly as the pool writes them, so the combine and
+  every later step are unchanged: texts identical by construction once each piece is proven.
+- Measured size (r3-e092 timing, repetition at pool 9 SIBLINGS + the NEON gate/up kernel): 5.5-5.6 CPU experts a
+  layer-window = ~265 expert computations x 2.33 MB = ~620 MB of weights a window through the CPU in `CPU` 47-58
+  ms (~11-13 GB/s over 9 A78AE cores), of 124-170 ms windows; prose 1.8-2.7 CPU experts, `CPU` 14-20 ms of ~80 ms.
+  The same bytes at ~150 GB/s on the GPU are ~4 ms: repetition windows could drop by ~40-50 ms (~+35-45%), prose
+  by ~12-16 ms (~+15-20%), all with texts identical if the replicas are exact.
+- Why it could pay: prose/repetition windows spend 27-37 ms in CPU compute (C3) plus file-tier waits (C4). The GPU
+  at ~150 GB/s on ~2-6 miss experts a layer-window (2.33 MB each) is ~1.5-4.5 ms a window if the bytes are page-
+  locked RAM (B14) and the kernels are not issue-bound like the hit kernels (they will be: scalar-exact float steps
+  per block, but only 10 IQ3_S / 20 IQ4_NL blocks a row).
+- Risks: the replicas must match every miss (one wrong bit changes text); glibc's expf is not correctly rounded,
+  so it must be the same algorithm, not a better one; whether the Orin's GPU can read pageable mmap pages directly
+  is not verified (B14's page-locked copy or a registered region avoids the question).
+- Where it plugs in (read, not built): verify.cpp `post()` already runs a GPU share of the misses, the "PCIe" groups
+  (`grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out)`, off in the base via `STRATA_NO_PCIE=1`), into
+  `hit_out`, and `moe_hit_add` / `STRATA_HIT_COMBINE` place every row at its (token, k) slot before the combine, so
+  the sum order does not depend on who computed a row (GPU rows enter as `0.0f + hit`: a -0.0 row becomes +0.0,
+  harmless unless a whole sum is zero). The replica kernels would replace `grouped()` for those groups, reading x
+  (fp32, the same bits the host copies to h_x_) and the blob pointers the plan already gives.
+- Step 0 (queued as r3-e095, commit bec4857c): the CPU replicas counted against ggml in the live engine
+  (`STRATA_MISS_REPLICA_CHECK=1`). Step 1: the CUDA replica kernels behind a switch, run beside the CPU for one layer
+  with a bit compare logged. Step 2: route the misses whose blobs are in B14's copy to them. Multi-iteration (L).
+- **C5 (commit b6f4b116, run r3-e100): steps 1 and 2 in one, without the side-by-side compare.** The replica kernels
+  (src/kernels/cuda/miss_exact.cu, `STRATA_MISS_GPU_EXACT=1`, forms `STRATA_MISS_GPU_FORMS`, default 1110) replace
+  the PCIe share's kernels; with `STRATA_NO_PCIE=0 --pcie-frac 1 --resident-budget-gib 4` every miss in the RAM copy
+  (<= 16 a layer) runs there. The served texts gate is the check (e093 showed it catches a single float-step change).
+  If texts change and e095's forms do not fix it, build the compare: run the replica for the CPU's own misses into a
+  side buffer and count unequal floats per kernel (q8k bytes, h q8_0 bytes, down rows).
+- **Step 0 result (r3-e095, C9): every piece has a 100% bit-equal form, and it is the default `1110`.** Over one
+  bench (texts 1.0 on all nine): q8_K(x) rows 59,081 fused 100% (split 99.6%); iq3_s dots 33.6 M fma 100% (mul+add
+  48%); expf 16.8 M fma and split cubic both 100%; q8_0(h) 122,369 rows 100%; iq4_nl dots 254 M fma(X,C,Y*F) 100%
+  (others 60% / 53%). The CPU replicas therefore are ggml's arithmetic; what is left unproven is only the CUDA port
+  of them (e100 texts, e101's float compare). Quirk: the first report line (engine.log:44) shows expf 42 with 84
+  bit-equal (a counter read before its total; later lines agree), not a correctness issue.
+- **C12 (r3-e109): texts changed because the model mixes expert types** (layer 0's gate/up are IQ3_XXS, type 18;
+  the replica covers IQ3_S/IQ4_NL only, and the planner still put that layer's misses in the PCIe share, which then
+  ran the GPU kernels). Fix 3fa70777: uncovered layers keep CPU misses (run r3-e114). An IQ3_XXS replica (ggml's
+  NEON ggml_vec_dot_iq3_xxs_q8_K: grid iq3xxs_grid, signs via ksigns_iq2xs, scale `0.5f + (aux32 >> 28)`, final
+  `0.25f * sumf`; prove it with a CPU replica count first, as e095 did for IQ3_S) would cover the rest. Memory: with
+  the PCIe share on, e109 lost ~2 GiB of MemAvailable beyond the copy's 1.46x (ready 7,011 vs 12,752 MiB), so under
+  the 6 GiB floor the copy is capped near ~1.5-2 GiB until that is found.
+- Reach limit: only misses in the RAM copy are GPU-readable (Orin has no pageable-memory GPU access; a memcpy into
+  pinned memory per miss costs more than the CPU compute). So B13's gain is capped by B14's copy hit rate on
+  prose/repetition misses (e097/e099 measure it).
+- **C7 (16:20, written, not built): faster loads for the replica, only if e100/e104 show the share is slow.** The
+  default `--pcie-mode auto` (2) copies each blob (2.33 MB) into device staging with a copy kernel, then the replica
+  reads it again: ~3x the bytes of reading it once (all one DRAM on the Orin). `--pcie-mode direct` (1) needs no
+  rebuild (expert_source.cpp:3500 gives the replica `device_alias()` pointers; verify.cpp:2365 skips the copy) =
+  `overrides/r3-e104-gpuexact-direct.json`. Risk: mx_gu_kernel / mx_down_kernel read 1-byte loads (qs 8, signs 4,
+  qh 1, scale 1 per sub-block; IQ4_NL 16 per block); from host-mapped pages these may not be cached in L1, so
+  direct could be slower. The fix if so (bitwise the same arithmetic, only where bytes come from): each warp first
+  copies its row into shared memory with 16-byte loads (`off = addr & 15`, `n = (bytes + off + 15) >> 4` uint4,
+  lanes stride 32; a row is 1,100 B gate/up (<= 70 uint4) or 360 B down (<= 24); an aligned 16-byte chunk never
+  crosses a page, so reading its slack bytes is safe), `__syncwarp()` before and after (the warp reuses the buffer
+  for gate then up), then `mx_iq3s_row(s_row + off, ...)` and the IQ4_NL decode read shared memory. ~25 lines, 9 KB
+  shared a block; put it behind `STRATA_MISS_GPU_STAGE=1` so the same exe A/Bs it (texts must be identical between
+  the two by construction).
+
+## B14: page-locked RAM copy of the non-GPU experts (iteration C4; runs r3-e096 / r3-e097)
+- `--resident-budget-gib N` / `--resident-experts` already exist (generate.cpp:2220-2240, 6557-6640; never run in
+  rounds 1-3). The copy is the file's bytes, built after the GPU cache, so slots and texts should not change; the
+  CPU computes misses from RAM instead of waiting for SSD reads (`decode waited` 1.7-2.7 s a prose/repetition
+  request in e090). Limits: the harness's 6 GiB MemAvailable floor (run_control.py). **Measured (C12): admission
+  MemAvailable drops 1.46x the copy** (e096 4.77 GiB -> 4.82, e097 4.00 GiB -> 5.96, both `pressure_abort`, from
+  e094's 11.79), so the usable budget is <= ~3.75 GiB (2.5 -> ~8.1, 3.5 -> ~6.7); the extra 0.46x is not in the
+  engine's copy code (the copied file pages are left to the OS cache; exchange buffers ~0.25 GiB); the copy holds the experts the *review* profile ranks hottest, which may not be the
+  ones prose/repetition miss. If e097 pays, a ranking from prose/repetition routing (a second profile, or the
+  adaptive tier's counters) is the code follow-up.
+
+## B15 (closed, iteration C10): B1's per-column dense slope under the bitwise rule; tensor-core GEMVs
+- The pinned mmvq expressions round per integer group (Q6_K 4 weights, Q4_K/Q5_K 8, IQ4_XS 32; native_mmvq.cu
+  :644 / :539 / :187 / :1413), so the per-column work of a bitwise kernel is one int multiply + conversion + FMA per
+  group in the pinned order, whatever forms the integer dot. Int8 `mma.m16n8k16` would use 4/16 or 8/16 of its k
+  and needs a C-fragment remap to the pinned lane order (4 virtual-warp sums, then the xor tree = a bit-reversed
+  binary tree over lanes); dp4a already does a 4-group. No gain on K-quants (92% of dense bytes). The Q6_K IL path
+  already skips I2F (`exact_i2f_22`); Q4_K/Q5_K's I2F is ~-0.2 ms a window (round 1 dropped it). Do not rebuild.
+- What is left for review on dense is the fixed T1 part (~137 GB/s vs ~180, ~4-5 ms a window): a load-time byte
+  re-layout with 16-byte loads ahead, same lane-to-chunk map and order (round 2 research-ideas.md item 3(c)). L item.
+
+## B16 (round 4 brief, iteration C11): review's fixed cost by stage, measured, and the two byte re-layouts it points to
+- **Measured, not guessed** (r3-e038 `STRATA_VERIFY_PROFILE`, review request 1, 101 windows; current kernels: IL,
+  GU_SWIGLU, the base's switches; runs/r3-e038-gusw-prof/engine.log:61 has the full per-T table). Bytes from the
+  same log's `native dense: types` line (engine.log:6; t14 Q6_K, t13 Q5_K, t12 Q4_K, t23 IQ4_XS, t20 IQ4_NL):
+
+  | stage (n_out, matrices) | MB | T1 ms | T1 GB/s | T4 ms |
+  | --- | --- | --- | --- | --- |
+  | GDN qkv (10240, 36) | 709 | 5.45 | 130 | 7.54 |
+  | GDN z (6144, 36) | 378 | 3.24 | 117 | 4.12 |
+  | out-proj (2560, 48) | 594 | 4.67 | 127 | 5.79 |
+  | QSA q (12288, 12; stage also holds q-idx: a lower bound) | 259 | 2.41 | 107 | 3.15 |
+  | **big four, sum** | **1,939** | **15.77** | **123** | **20.60** |
+  | shared expert + quant (640 x 96, 2560 x 48) | 143 | 2.82 | **51** | 4.57 |
+  | head (Q5_K) | 521 | 3.43 | 152 | 4.78 |
+  | VRAM-hit gate/up+SwiGLU (10 a layer at T1 = 480 x 1.408 MB) | 676 | 6.29 | **107** | 17.24 |
+  | VRAM-hit down (480 x 0.92 MB) | 442 | 3.65 | 121 | 9.28 |
+
+  (T1 window 48.81 ms profiled, T4 80.71. T4 expert rates: ~30 distinct hits a layer-window on average, so gate/up
+  ~119 GB/s and down ~144 GB/s, lower bounds. The streaming ceiling on this board is ~172-180 GB/s with 4-8 loads in
+  flight a thread; round 1 p037, another project on the board.)
+- **Sizing at a 165 GB/s target, per window, holding today's per-column slopes:** big four -4.0 ms (15.77 -> 11.75),
+  expert gate/up -2.2 ms at T1 / ~-4.8 at T4, down -1.0 / -1.2, shared expert ~-2 (it is latency-bound: ~3 small
+  launches a layer at ~20 us each, not a byte problem). Review's mix is half T4 windows: **dense alone ~-4 ms of a
+  ~77 ms window = ~+5% review (37.0 -> ~38.9)**, dense + gate/up ~+10-11%. These are the only review levers above
+  the 0.5% spread left after C4/C8/C10 (B1b, N6, B2, B15 are closed or below it).
+- **Why the dense rate is ~123 GB/s (code read, native_mmvq.cu):** Q6_K's 210-byte blocks are only 2-byte aligned,
+  so `IlQ6K` / `Q6KTraits::load` (:1043-1058) read ql and qh through `load_int_b2` (two 16-bit loads an int), plus 2
+  int8 scale loads and a half `d`: ~7 load instructions per lane per block, 4 blocks per lane per `m0` step, each
+  step's 4 `v` iterations behind a `kbx < bpr` guard (so ptxas does not hoist the 4 blocks' loads together; at the
+  64-register cap Q6_K NC4 R1 already needs 70). Little's law at 180 GB/s x ~0.6 us is ~6.8 KB in flight a SM; one
+  210-B block a warp x 32 warps is ~6.7 KB: right at the edge, which fits ~120-130 GB/s.
+- **Re-layout 1 (dense, bitwise by construction): lane-major 4-block groups.** Per row, for each group of 4 blocks
+  (`m0 .. m0+3`, exactly what one lane's `v = 0..3` covers in native_mmvq_il_kernel), store: ql word `iqs` of the 4
+  blocks contiguous (16 B per lane: one LDG.128), qh word `qh_word(iqs)` of the 4 blocks (16 B, lanes iqs and
+  iqs+8 share it: same transaction), the 2 scale bytes `scales[so]`, `scales[so+4]` of the 4 blocks (8 B: LDG.64),
+  the 4 `d` (8 B, warp broadcast). Same 840 bytes a group, so a row keeps its stride (2,100 / 5,040 / ... B); the
+  tail group (n_in 2560 = 10 blocks -> 4, 4, 2) is the same form at 2 blocks (LDG.64s). 4 loads a lane per 4 blocks
+  instead of ~28; the integers into each dp4a, the `q6_q8_dot_impl<true>` expression, `acc[v]` and the reduction are
+  untouched, so outputs are bitwise those of today's IL kernel, and the T1 order is the same (IL's acc[v] = the T1
+  kernel's warp v partial; that is why IL is already bitwise with native_q6_k_mmvq_kernel<false>), so one NC = 1..6
+  kernel serves every window size.
+  Plumbing that already exists: the `STRATA_Q6_PACKED` registry (`q6_packed_registry`, `native_q6_k_pack`,
+  native_mmvq.cu:1843-2050; native_head.cpp:67 and mtp.cpp:844 register the heads) maps a weight pointer to a
+  packed copy and `native_q6_k_mmvq` dispatches to it first (:2380). Add: a pack format flag, registration of the
+  dense Q6_K matrices (native_dense.cpp), and the lookup inside `native_mmvq_il` (:2710, case 14) as well. Memory:
+  a duplicate copy is 1.29 GiB for Q6_K (2.0 GiB for all four types), allocated after the expert cache is sized
+  (`--expert-cache 14629` is an explicit cap, so slots stay 19,068); MemAvailable ~11.9 -> ~10.6 GiB, fine alone,
+  too tight with B14's 4 GiB copy. Prefill keeps reading the GGUF copy (so prompt texts cannot move). Round 1's
+  packed head (e006: planes, one 4-B load a thread, persistent 640 grid) was slower; the difference here is 16-byte
+  loads with 4 in flight a lane and no persistent grid.
+- **First experiments, cheapest first:** (1) no layout change: split the `m0` loop into a guard-free main part
+  (all 4 blocks' `F::load` issued before any `apply`) + the guarded tail (round 1 idea (a), strata-ar-lab
+  notes.md:1095); same order, so bitwise; check ptxas spills at NC 1-4 (`STRATA_BW_PROBE=1` prints registers and
+  blocks a SM). (2) The layout above for Q6_K only (64% of dense bytes), checked bitwise and timed by
+  `build/mmvq_il_parity --bench` (it already cycles weight copies past the L2) if the harness can run it, else by a
+  load-time self-test like `STRATA_Q6P_SELFTEST`. (3) Q5_K / Q4_K / IQ4_XS the same way.
+- **Re-layout 2 (expert gate/up, IQ3_S):** `Split<21>::load` (iq_kernels.cu:809-830) reads a 110-B block as 4 + 2
+  16-bit loads (qs, signs) + qh/scales bytes + `d` = 9 loads for 15 bytes a lane, then 8 grid gathers. Rows are
+  1,100 B (10 blocks, 4-byte aligned), so per row the planes qs 640 | qh 80 | signs 320 | scales 40 | d 20 are the
+  same bytes, all 4-aligned: 5-6 loads a lane. Same integers, bitwise. Harder than dense: the slots are also read
+  by the prefill expert kernels (prefill/moe_fused_iq.cu, moe_mmq.cu), and a duplicate of 19,068 slots is
+  impossible, so it must be in place at slot-fill time with every GPU reader switched. Round 1 e039 (all 5 chunk
+  loads hoisted: +5.5% slower, register pressure) says to watch occupancy. Do the dense one first.
