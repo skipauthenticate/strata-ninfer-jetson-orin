@@ -11,6 +11,7 @@
 #include "strata/platform/memory.hpp"
 #include "strata/platform/integration_trace.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/miss_exact.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/kq_avx1.hpp"
@@ -3438,8 +3439,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         // ar opt-in STRATA_NO_PCIE=1: no PCIe share in decode windows (misses go to the CPU), so verify.cpp skips its launches
         static const bool no_pcie = [] { const char* v = std::getenv("STRATA_NO_PCIE"); return v && v[0] == '1'; }();
-        const bool pcie_ok = !no_pcie && d.pcie_num > 0 && d.src->pcie_layer(d.layers);
+        // ar STRATA_MISS_GPU_EXACT (B13): a layer the replica does not cover (r3-e109: layer 0's gate/up are IQ3_XXS, type
+        // 18) keeps its misses on the CPU; its PCIe share would run the GPU kernels and change text (mode 1) or add GPU
+        // rows on top of the CPU's (mode 2)
+        const NativeFmt* mxf = native ? &lay.fmt[(size_t) d.layers] : nullptr;
+        const bool mx_ok = !strata::kernels::miss_exact_enabled() ||
+                           (mxf != nullptr && strata::kernels::miss_exact_supported(
+                                                  strata::kernels::native_expert_layout(mxf->gu_type, mxf->d_type,
+                                                                                        mxf->n_embd, mxf->n_ff),
+                                                  (int) n_tok, n_tok * k, 0));
+        const bool pcie_ok = !no_pcie && mx_ok && d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
+        // ar STRATA_MISS_GPU_EXACT=2 (check mode, miss_exact.cu): the PCIe groups are published for the GPU's replica,
+        // but their entries stay CPU entries (kind -1, after counts[1]), so the window's rows are the CPU's as without it
+        static const bool mx_check = [] { const char* v = std::getenv("STRATA_MISS_GPU_EXACT"); return v && v[0] == '2'; }();
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -3476,7 +3489,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
+                if (first_of[i] == i0) kind[i] = (kd == 1 && mx_check) ? -1 : kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
@@ -3489,6 +3502,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++groups;
         }
         P.start[groups] = entries;
+        const int vram_entries = entries;
         const uint64_t bb = lay.blob_bytes(d.layers);
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
@@ -3505,8 +3519,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         P.start2[fetches] = entries;
         P.counts[0] = groups;
-        P.counts[1] = entries;
+        P.counts[1] = mx_check ? vram_entries : entries;
         P.counts[2] = fetches;
+        if (mx_check) strata::kernels::miss_exact_report();   // the previous layers' compare totals, now and then
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);

@@ -13,6 +13,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/miss_exact.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_router.hpp"
@@ -1176,6 +1177,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(this, 64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(this, T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    // ar opt-in STRATA_MISS_GPU_EXACT=1 (B13): its expf table, here because a window may be captured into a graph
+    if (strata::kernels::miss_exact_enabled() && !strata::kernels::miss_exact_init(err)) return false;
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -2368,7 +2371,28 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            if (!no_pcie) grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+            if (!no_pcie) {
+                // ar opt-in STRATA_MISS_GPU_EXACT=1 (B13): those misses with ggml-cpu's rounding (miss_exact.cu), so the
+                // rows are the bits the CPU would have written; a layout the replicas do not cover keeps grouped()
+                bool exact = false;
+                if (strata::kernels::miss_exact_enabled() && lay.native) {
+                    const auto& f = lay.fmt[(size_t) l];
+                    const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                    exact = strata::kernels::miss_exact_supported(L, n, cap, grp);
+                    float* const mx_out = strata::kernels::miss_exact_mode() == 2 ? strata::kernels::miss_exact_side(grp) : hit_out;
+                    if (exact && mx_out != nullptr)
+                        strata::kernels::miss_exact_grouped(L, p_ptr2, p_start2, p_counts + 2, p_dst, p_tok, mixed_ + tb * N,
+                                                            n, grp, mx_out, cs, (int) kPcieGroupRows);
+                    else {
+                        static std::atomic<bool> warned{false};
+                        if (!warned.exchange(true))
+                            std::fprintf(stderr, "strata verify: STRATA_MISS_GPU_EXACT=1 does not cover layer %lld (types "
+                                                 "%d/%d, %d tokens, group %d): its PCIe share keeps the GPU kernels\n",
+                                         (long long) l, f.gu_type, f.d_type, n, grp);
+                    }
+                }
+                if (!exact) grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+            }
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
@@ -2377,6 +2401,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             } else {
                 wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
                 stamp(l, 23, grp);
+                // ar STRATA_MISS_GPU_EXACT=2: the replica's rows of the PCIe groups (the CPU computed them too) vs the CPU's
+                if (strata::kernels::miss_exact_mode() == 2 && !no_pcie && strata::kernels::miss_exact_side(grp) != nullptr)
+                    strata::kernels::miss_exact_compare(p_start2, p_counts + 2, p_dst, m_ymiss_ + (size_t) tb * K * N, grp,
+                                                        (int) l, cs);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
                 else if (hit_combine) {
